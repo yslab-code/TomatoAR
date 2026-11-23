@@ -1,0 +1,13 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+app/src/main/cpp/ncnn-android-vulkan/
+!gradle/wrapper/gradle-wrapper.jar
+!app/src/main/assets/*

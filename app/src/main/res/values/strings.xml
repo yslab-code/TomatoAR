@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TomatoAR 采收相机</string>
+    <string name="status_live">实时</string>
+    <string name="status_frozen">已定格</string>
+    <string name="status_album">相册图</string>
+    <string name="resume_live">继续检测</string>
+    <string name="back_to_camera">返回相机</string>
+    <string name="save_annotated">保存标注图</string>
+    <string name="cd_settings">打开参数面板</string>
+    <string name="cd_gallery">从相册选图</string>
+    <string name="cd_shutter">定格当前画面</string>
+    <string name="cd_flip_camera">切换前后摄像头</string>
+    <string name="cd_close">关闭</string>
+</resources>

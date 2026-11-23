@@ -1,0 +1,71 @@
+name: Build TomatoAR Debug APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK, CMake, and NDK r30
+        run: |
+          set -euo pipefail
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          NDK_PKG="$("$SDKMANAGER" --list | grep -oE 'ndk;30\.[0-9]+\.[0-9]+' | sort -V | tail -n 1 || true)"
+          if [ -z "$NDK_PKG" ]; then
+            echo "WARNING: NDK r30 not found in sdkmanager list, falling back to latest available NDK"
+            NDK_PKG="$("$SDKMANAGER" --list | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)"
+          fi
+          if [ -z "$NDK_PKG" ]; then
+            echo "ERROR: No NDK package found in sdkmanager"
+            exit 1
+          fi
+          NDK_VER="${NDK_PKG#ndk;}"
+          echo "Selected NDK: $NDK_PKG (version=$NDK_VER)"
+          echo "NDK_VER=$NDK_VER" >> "$GITHUB_ENV"
+
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "$NDK_PKG"
+
+      - name: Download and verify NCNN Android Vulkan (20261020)
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o ncnn.zip "https://github.com/Tencent/ncnn/releases/download/20261020/ncnn-20261020-android-vulkan.zip"
+          echo "6e0c5f9b397faf32b923de2ef6210af9bf375851869dceff06a8005331981086  ncnn.zip" | sha256sum -c -
+          mkdir -p app/src/main/cpp/ncnn-android-vulkan
+          unzip -q ncnn.zip -d app/src/main/cpp/ncnn-android-vulkan
+          rm -f ncnn.zip
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug -PndkVersionOverride="$NDK_VER"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TomatoAR-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="hud_surface">#B31C1C1E</color>
+    <color name="hud_stroke">#26FFFFFF</color>
+    <color name="sheet_surface">#F51C1C1E</color>
+    <color name="card_surface">#E618181A</color>
+    <color name="pill_inactive">#26FFFFFF</color>
+    <color name="pill_active">#FFFFFFFF</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B8B8BE</color>
+    <color name="accent_green">#34C759</color>
+    <color name="accent_orange">#FF9500</color>
+    <color name="accent_red">#FF3B30</color>
+    <color name="divider">#1FFFFFFF</color>
+</resources>
