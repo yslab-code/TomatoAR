@@ -1123,142 +1123,143 @@ class MainActivity : AppCompatActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
-            val bindEpoch = cameraBindEpoch.incrementAndGet()
-            val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
+            try {
+                unbindCameraSafely()
+                val bindEpoch = cameraBindEpoch.incrementAndGet()
+                val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
 
-            imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
-                try {
-                    if (mode != AppMode.LIVE || !modelReady || modelInitInProgress.get() ||
-                        bindEpoch != cameraBindEpoch.get()
-                    ) {
-                        return@setAnalyzer
-                    }
-                    val frameSession = activeSessionId.get()
-                    val cfgCopy = config
-                    val shouldFreeze = freezeRequested.compareAndSet(true, false)
+                imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
+                    try {
+                        if (mode != AppMode.LIVE || !modelReady || modelInitInProgress.get() ||
+                            bindEpoch != cameraBindEpoch.get()
+                        ) {
+                            return@setAnalyzer
+                        }
+                        val frameSession = activeSessionId.get()
+                        val cfgCopy = config
+                        val shouldFreeze = freezeRequested.compareAndSet(true, false)
 
-                    if (shouldFreeze) {
-                        val upright = imageProxyToUprightBitmap(imageProxy, isFront)
-                        if (upright == null) {
+                        if (shouldFreeze) {
+                            val upright = imageProxyToUprightBitmap(imageProxy, isFront)
+                            if (upright == null) {
+                                runOnUiThread {
+                                    if (!isDestroyed && !isFinishing) {
+                                        Toast.makeText(this, "定格采图失败，请重试", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                                return@setAnalyzer
+                            }
+                            if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
+                                upright.recycle()
+                                return@setAnalyzer
+                            }
+                            val token = imageTokenGenerator.incrementAndGet()
+                            val result = detector.detectFrame(upright, cfgCopy)
+                            if (result.success) {
+                                cachedBitmapToken.set(token)
+                            }
+                            if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
+                                upright.recycle()
+                                return@setAnalyzer
+                            }
+                            val snap = FrameSnapshot(frameSession, token, upright, result)
                             runOnUiThread {
-                                if (!isDestroyed && !isFinishing) {
-                                    Toast.makeText(this, "定格采图失败，请重试", Toast.LENGTH_SHORT).show()
+                                if (isDestroyed || isFinishing) {
+                                    upright.recycle()
+                                    return@runOnUiThread
+                                }
+                                if (mode == AppMode.LIVE && snap.sessionId == activeSessionId.get()) {
+                                    lockedSnapshot = snap
+                                    mode = AppMode.FROZEN
+                                    unbindCameraSafely()
+                                    updateModeUi()
+                                    renderSnapshot(snap)
+                                } else {
+                                    upright.recycle()
                                 }
                             }
                             return@setAnalyzer
                         }
-                        if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
+
+                        val plane = imageProxy.planes.firstOrNull()
+                        val canDirectRgba = plane != null && plane.pixelStride == 4 && plane.buffer.isDirect
+                        val result: DetectionResult
+                        val uprightW: Int
+                        val uprightH: Int
+
+                        if (canDirectRgba) {
+                            val p = plane!!
+                            val buf = p.buffer
+                            buf.rewind()
+                            val crop = imageProxy.cropRect
+                            val imgW = imageProxy.width
+                            val imgH = imageProxy.height
+                            if (imgW <= 0 || imgH <= 0) return@setAnalyzer
+                            val cropLeft = crop.left.coerceIn(0, imgW - 1)
+                            val cropTop = crop.top.coerceIn(0, imgH - 1)
+                            val cropW = crop.width().coerceIn(1, imgW - cropLeft)
+                            val cropH = crop.height().coerceIn(1, imgH - cropTop)
+                            val rot = imageProxy.imageInfo.rotationDegrees
+
+                            cachedBitmapToken.set(0L)
+                            result = detector.detectRgbaFrame(
+                                rgbaBuffer = buf,
+                                bufWidth = imgW,
+                                bufHeight = imgH,
+                                rowStride = p.rowStride,
+                                cropLeft = cropLeft,
+                                cropTop = cropTop,
+                                cropWidth = cropW,
+                                cropHeight = cropH,
+                                rotationDegrees = rot,
+                                mirrorHorizontal = isFront,
+                                config = cfgCopy
+                            )
+                            val swapWh = (rot == 90 || rot == 270)
+                            uprightW = if (swapWh) cropH else cropW
+                            uprightH = if (swapWh) cropW else cropH
+                        } else {
+                            val upright = imageProxyToUprightBitmap(imageProxy, isFront) ?: return@setAnalyzer
+                            cachedBitmapToken.set(0L)
+                            result = detector.detectFrame(upright, cfgCopy)
+                            uprightW = upright.width
+                            uprightH = upright.height
                             upright.recycle()
+                        }
+
+                        if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
                             return@setAnalyzer
                         }
-                        val token = imageTokenGenerator.incrementAndGet()
-                        val result = detector.detectFrame(upright, cfgCopy)
-                        if (result.success) {
-                            cachedBitmapToken.set(token)
-                        }
-                        if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
-                            upright.recycle()
-                            return@setAnalyzer
-                        }
-                        val snap = FrameSnapshot(frameSession, token, upright, result)
+
+                        updateFpsOnAnalyzerThread(frameSession)
+                        val state = LiveFrameState(frameSession, uprightW, uprightH, result)
                         runOnUiThread {
-                            if (isDestroyed || isFinishing) {
-                                upright.recycle()
-                                return@runOnUiThread
-                            }
-                            if (mode == AppMode.LIVE && snap.sessionId == activeSessionId.get()) {
-                                lockedSnapshot = snap
-                                mode = AppMode.FROZEN
-                                unbindCameraSafely()
-                                updateModeUi()
-                                renderSnapshot(snap)
-                            } else {
-                                upright.recycle()
+                            if (!isDestroyed && !isFinishing && mode == AppMode.LIVE && state.sessionId == activeSessionId.get()) {
+                                latestLiveState = state
+                                renderLiveState(state)
                             }
                         }
-                        return@setAnalyzer
+                    } finally {
+                        imageProxy.close()
                     }
-
-                    val plane = imageProxy.planes.firstOrNull()
-                    val canDirectRgba = plane != null && plane.pixelStride == 4 && plane.buffer.isDirect
-                    val result: DetectionResult
-                    val uprightW: Int
-                    val uprightH: Int
-
-                    if (canDirectRgba) {
-                        val p = plane!!
-                        val buf = p.buffer
-                        buf.rewind()
-                        val crop = imageProxy.cropRect
-                        val imgW = imageProxy.width
-                        val imgH = imageProxy.height
-                        if (imgW <= 0 || imgH <= 0) return@setAnalyzer
-                        val cropLeft = crop.left.coerceIn(0, imgW - 1)
-                        val cropTop = crop.top.coerceIn(0, imgH - 1)
-                        val cropW = crop.width().coerceIn(1, imgW - cropLeft)
-                        val cropH = crop.height().coerceIn(1, imgH - cropTop)
-                        val rot = imageProxy.imageInfo.rotationDegrees
-
-                        cachedBitmapToken.set(0L)
-                        result = detector.detectRgbaFrame(
-                            rgbaBuffer = buf,
-                            bufWidth = imgW,
-                            bufHeight = imgH,
-                            rowStride = p.rowStride,
-                            cropLeft = cropLeft,
-                            cropTop = cropTop,
-                            cropWidth = cropW,
-                            cropHeight = cropH,
-                            rotationDegrees = rot,
-                            mirrorHorizontal = isFront,
-                            config = cfgCopy
-                        )
-                        val swapWh = (rot == 90 || rot == 270)
-                        uprightW = if (swapWh) cropH else cropW
-                        uprightH = if (swapWh) cropW else cropH
-                    } else {
-                        val upright = imageProxyToUprightBitmap(imageProxy, isFront) ?: return@setAnalyzer
-                        cachedBitmapToken.set(0L)
-                        result = detector.detectFrame(upright, cfgCopy)
-                        uprightW = upright.width
-                        uprightH = upright.height
-                        upright.recycle()
-                    }
-
-                    if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
-                        return@setAnalyzer
-                    }
-
-                    updateFpsOnAnalyzerThread(frameSession)
-                    val state = LiveFrameState(frameSession, uprightW, uprightH, result)
-                    runOnUiThread {
-                        if (!isDestroyed && !isFinishing && mode == AppMode.LIVE && state.sessionId == activeSessionId.get()) {
-                            latestLiveState = state
-                            renderLiveState(state)
-                        }
-                    }
-                } finally {
-                    imageProxy.close()
                 }
-            }
 
-            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-            val viewPort = previewView.viewPort ?: ViewPort.Builder(
-                Rational(previewView.width.coerceAtLeast(1), previewView.height.coerceAtLeast(1)),
-                rotation
-            ).setScaleType(ViewPort.FIT).build()
+                val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+                val viewPort = previewView.viewPort ?: ViewPort.Builder(
+                    Rational(previewView.width.coerceAtLeast(1), previewView.height.coerceAtLeast(1)),
+                    rotation
+                ).setScaleType(ViewPort.FIT).build()
 
-            val group = UseCaseGroup.Builder()
-                .addUseCase(preview)
-                .addUseCase(imageAnalysis)
-                .setViewPort(viewPort)
-                .build()
+                val group = UseCaseGroup.Builder()
+                    .addUseCase(preview)
+                    .addUseCase(imageAnalysis)
+                    .setViewPort(viewPort)
+                    .build()
 
-            try {
-                unbindCameraSafely()
                 currentImageAnalysis = imageAnalysis
                 provider.bindToLifecycle(this, selector, group)
             } catch (e: Exception) {
+                cameraBindEpoch.incrementAndGet()
                 currentImageAnalysis = null
                 Toast.makeText(this, "摄像头绑定失败：${e.message}", Toast.LENGTH_LONG).show()
             }
