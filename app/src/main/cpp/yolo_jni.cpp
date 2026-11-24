@@ -425,13 +425,11 @@ bool run_cpu_fp32_gradient_ref(
     return true;
 }
 
-bool load_cpu_net_and_probe(
+bool load_cpu_net_only(
         AAssetManager* mgr,
         bool fp16_arith,
         const ncnn::CpuSet& mask,
         int threads,
-        const ncnn::Mat& grad_in,
-        ncnn::Mat& grad_out,
         std::string& err_msg) {
     clear_runtime_state();
     apply_cpu_affinity_now(mask, threads);
@@ -465,75 +463,130 @@ bool load_cpu_net_and_probe(
         clear_runtime_state();
         return false;
     }
+    return true;
+}
 
+bool probe_zero_and_grad(
+        bool fp16_arith,
+        const ncnn::Mat& grad_in,
+        ncnn::Mat& grad_out,
+        std::string& err_msg) {
     {
         ncnn::Mat zero_in(kModelInputSize, kModelInputSize, 3);
         zero_in.fill(0.0f);
         ncnn::Extractor ex = g_yolo_net.create_extractor();
-        ex.set_num_threads(threads);
         if (ex.input("in0", zero_in) != 0) {
             err_msg = "试推理输入节点 in0 绑定失败";
-            clear_runtime_state();
             return false;
         }
         ncnn::Mat zero_out;
         const int ex_ret = ex.extract("out0", zero_out);
         if (ex_ret != 0) {
             err_msg = "试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
-            clear_runtime_state();
             return false;
         }
         if (!validate_probe_output(zero_out, fp16_arith, err_msg)) {
-            clear_runtime_state();
             return false;
         }
     }
 
     {
         ncnn::Extractor ex = g_yolo_net.create_extractor();
-        ex.set_num_threads(threads);
         if (ex.input("in0", grad_in) != 0) {
             err_msg = "梯度试推理输入节点 in0 绑定失败";
-            clear_runtime_state();
             return false;
         }
         const int ex_ret = ex.extract("out0", grad_out);
         if (ex_ret != 0) {
             err_msg = "梯度试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
-            clear_runtime_state();
             return false;
         }
         if (!validate_probe_output(grad_out, fp16_arith, err_msg)) {
-            clear_runtime_state();
             return false;
         }
     }
-
     return true;
 }
 
-bool benchmark_loaded_cpu_net(
+bool load_cpu_net_and_probe(
+        AAssetManager* mgr,
+        bool fp16_arith,
+        const ncnn::CpuSet& mask,
+        int threads,
         const ncnn::Mat& grad_in,
+        ncnn::Mat& grad_out,
+        std::string& err_msg) {
+    if (!load_cpu_net_only(mgr, fp16_arith, mask, threads, err_msg)) {
+        return false;
+    }
+    if (!probe_zero_and_grad(fp16_arith, grad_in, grad_out, err_msg)) {
+        clear_runtime_state();
+        return false;
+    }
+    return true;
+}
+
+bool benchmark_cpu_precision(
+        AAssetManager* mgr,
+        bool fp16_arith,
+        const ncnn::Mat& grad_in,
+        const ncnn::Mat* fp32_ref,
         const std::vector<CpuAffinityCandidate>& cands,
+        ncnn::Mat* out_first_grad,
         CpuAffinityCandidate& best_cand,
-        float& best_ms) {
+        float& best_ms,
+        int& loaded_threads,
+        std::string& err_msg) {
+    loaded_threads = -1;
+    bool validated = false;
     bool has_best = false;
+
     for (const auto& c : cands) {
-        apply_cpu_affinity_now(c.mask, c.threads);
-        {
+        if (loaded_threads != c.threads) {
+            if (!load_cpu_net_only(mgr, fp16_arith, c.mask, c.threads, err_msg)) {
+                loaded_threads = -1;
+                if (!validated) {
+                    return false;
+                }
+                continue;
+            }
+            loaded_threads = c.threads;
+        } else {
+            apply_cpu_affinity_now(c.mask, c.threads);
+        }
+
+        ncnn::Mat warm_out;
+        if (!validated) {
+            if (!probe_zero_and_grad(fp16_arith, grad_in, warm_out, err_msg)) {
+                loaded_threads = -1;
+                clear_runtime_state();
+                return false;
+            }
+            if (fp32_ref != nullptr) {
+                const float diff = max_cls_diff_between(warm_out, *fp32_ref);
+                if (!std::isfinite(diff) || diff > kGpuProbeMaxClsDiff) {
+                    err_msg = "CPU FP16 数值校验偏差过大 (diff=" + std::to_string(diff) + ")";
+                    loaded_threads = -1;
+                    clear_runtime_state();
+                    return false;
+                }
+            }
+            if (out_first_grad != nullptr) {
+                *out_first_grad = warm_out;
+            }
+            validated = true;
+        } else {
             ncnn::Extractor warm = g_yolo_net.create_extractor();
-            warm.set_num_threads(c.threads);
-            ncnn::Mat warm_out;
             if (warm.input("in0", grad_in) != 0 || warm.extract("out0", warm_out) != 0) {
                 continue;
             }
         }
+
         float cand_min_ms = 1e9f;
         bool ok = true;
         for (int rep = 0; rep < 2; ++rep) {
             const auto t0 = std::chrono::steady_clock::now();
             ncnn::Extractor ex = g_yolo_net.create_extractor();
-            ex.set_num_threads(c.threads);
             ncnn::Mat out;
             if (ex.input("in0", grad_in) != 0 || ex.extract("out0", out) != 0) {
                 ok = false;
@@ -563,11 +616,14 @@ bool benchmark_loaded_cpu_net(
             has_best = true;
         }
     }
+
+    if (!has_best && err_msg.empty()) {
+        err_msg = fp16_arith ? "CPU FP16 基准测试失败" : "CPU FP32 基准测试失败";
+    }
     return has_best;
 }
 
 void commit_cpu_state(const CpuAffinityCandidate& cand, bool fp16_arith, float bench_ms, std::string& backend_label) {
-    g_yolo_net.opt.num_threads = cand.threads;
     g_active_cpu_mask = cand.mask;
     g_active_cpu_threads = cand.threads;
     ++g_cpu_affinity_epoch;
@@ -612,43 +668,42 @@ bool load_and_tune_cpu(AAssetManager* mgr, std::string& err_msg, std::string& ba
 
     std::vector<CpuAffinityCandidate> cands;
     build_cpu_affinity_candidates(cands);
-    const CpuAffinityCandidate& init_cand = cands.front();
 
     ncnn::Mat fp32_grad_out;
-    if (!load_cpu_net_and_probe(mgr, false, init_cand.mask, init_cand.threads, grad_in, fp32_grad_out, err_msg)) {
-        clear_runtime_state();
-        return false;
-    }
-
     CpuAffinityCandidate best_fp32;
     float best_fp32_ms = 0.0f;
-    if (!benchmark_loaded_cpu_net(grad_in, cands, best_fp32, best_fp32_ms)) {
-        err_msg = "CPU FP32 基准测试失败";
+    int cur_threads = -1;
+    if (!benchmark_cpu_precision(
+            mgr, false, grad_in, nullptr, cands, &fp32_grad_out,
+            best_fp32, best_fp32_ms, cur_threads, err_msg)) {
         clear_runtime_state();
         return false;
     }
 
-    bool tried_fp16_load = false;
+    bool cur_fp16 = false;
     if (cpu_supports_hw_fp16_arith()) {
-        tried_fp16_load = true;
-        ncnn::Mat fp16_grad_out;
+        CpuAffinityCandidate best_fp16;
+        float best_fp16_ms = 0.0f;
+        int fp16_threads = -1;
         std::string fp16_err;
-        if (load_cpu_net_and_probe(mgr, true, init_cand.mask, init_cand.threads, grad_in, fp16_grad_out, fp16_err)) {
-            const float diff = max_cls_diff_between(fp16_grad_out, fp32_grad_out);
-            if (std::isfinite(diff) && diff <= kGpuProbeMaxClsDiff) {
-                CpuAffinityCandidate best_fp16;
-                float best_fp16_ms = 0.0f;
-                if (benchmark_loaded_cpu_net(grad_in, cands, best_fp16, best_fp16_ms) &&
-                    best_fp16_ms < best_fp32_ms) {
-                    commit_cpu_state(best_fp16, true, best_fp16_ms, backend_label);
-                    return true;
-                }
+        const bool fp16_ok = benchmark_cpu_precision(
+                mgr, true, grad_in, &fp32_grad_out, cands, nullptr,
+                best_fp16, best_fp16_ms, fp16_threads, fp16_err);
+        cur_fp16 = true;
+        cur_threads = fp16_threads;
+        if (fp16_ok && best_fp16_ms < best_fp32_ms) {
+            if (cur_threads != best_fp16.threads &&
+                !load_cpu_net_only(mgr, true, best_fp16.mask, best_fp16.threads, err_msg)) {
+                clear_runtime_state();
+                return false;
             }
+            commit_cpu_state(best_fp16, true, best_fp16_ms, backend_label);
+            return true;
         }
     }
 
-    if (tried_fp16_load) {
-        if (!load_cpu_net_and_probe(mgr, false, best_fp32.mask, best_fp32.threads, grad_in, fp32_grad_out, err_msg)) {
+    if (cur_fp16 || cur_threads != best_fp32.threads) {
+        if (!load_cpu_net_only(mgr, false, best_fp32.mask, best_fp32.threads, err_msg)) {
             clear_runtime_state();
             return false;
         }
@@ -1017,9 +1072,6 @@ bool run_net(
 
     ensure_thread_cpu_affinity();
     ncnn::Extractor ex = g_yolo_net.create_extractor();
-    if (!g_gpu_active) {
-        ex.set_num_threads(g_active_cpu_threads);
-    }
     if (ex.input("in0", g_input_pad) != 0) {
         out_ret = -1.0f;
         out_dims = 0.0f;
