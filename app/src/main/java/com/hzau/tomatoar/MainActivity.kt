@@ -18,6 +18,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Rational
@@ -95,7 +96,12 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val detector = YoloDetector()
-    private val analyzerExecutor = Executors.newSingleThreadExecutor()
+    private val analyzerExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+            runnable.run()
+        }, "TomatoAR-Analyzer")
+    }
     private val inferenceExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
