@@ -38,6 +38,8 @@ data class TrussItem(
     val gradeCode: Int, // 0: 待检, 1: A, 2: B, 3: C, 4: D, 5: E
     val maturity: Float // < 0 when empty
 ) {
+    val idText: String = "#$id"
+
     val totalFruits: Int get() = ripeCount + turningCount + immatureCount
 
     val gradeLetter: String
@@ -132,9 +134,124 @@ class YoloDetector {
         const val ERR_NCNN_EXTRACT = 5
         const val ERR_RGBA_BUFFER = 6
         const val ERR_NO_CACHE = 7
+        const val ERR_NATIVE_LOAD = 8
 
-        init {
-            System.loadLibrary("dgtruss_yolo")
+        @Volatile
+        private var nativeLoaded = false
+
+        @Volatile
+        private var nativeLoadError: String? = null
+
+        private val loadLock = Any()
+
+        internal fun ensureNativeLoaded(): String? {
+            if (nativeLoaded) return null
+            synchronized(loadLock) {
+                if (nativeLoaded) return null
+                return try {
+                    System.loadLibrary("dgtruss_yolo")
+                    nativeLoaded = true
+                    nativeLoadError = null
+                    null
+                } catch (e: UnsatisfiedLinkError) {
+                    val msg = "原生推理库加载失败（仅支持 arm64-v8a 设备）：${e.message ?: "UnsatisfiedLinkError"}"
+                    nativeLoadError = msg
+                    msg
+                } catch (e: SecurityException) {
+                    val msg = "原生推理库加载受限：${e.message ?: "SecurityException"}"
+                    nativeLoadError = msg
+                    msg
+                }
+            }
+        }
+
+        private fun Float.safeRoundToInt(default: Int = 0): Int {
+            return if (isFinite()) roundToInt() else default
+        }
+
+        internal fun parseDetectionResult(raw: FloatArray?): DetectionResult {
+            if (raw == null || raw.isEmpty()) {
+                return DetectionResult(false, "JNI 返回空结果", 0f, emptyList(), emptyList(), -1)
+            }
+            val header = raw[0]
+            if (!header.isFinite()) {
+                return DetectionResult(false, "JNI 返回非有限状态头", 0f, emptyList(), emptyList(), -2)
+            }
+            if (header < 0f) {
+                val code = raw.getOrElse(1) { 0f }.safeRoundToInt()
+                val ret = raw.getOrElse(2) { 0f }.safeRoundToInt()
+                val dims = raw.getOrElse(3) { 0f }.safeRoundToInt()
+                val h = raw.getOrElse(4) { 0f }.safeRoundToInt()
+                val w = raw.getOrElse(5) { 0f }.safeRoundToInt()
+                val msg = when (code) {
+                    ERR_MODEL_NOT_LOADED -> "模型尚未加载完成"
+                    ERR_BITMAP_INFO -> "无法读取 Bitmap 像素信息"
+                    ERR_BITMAP_FORMAT -> "Bitmap 格式需为 RGBA_8888 (实际=$ret, ${w}x${h})"
+                    ERR_PREPROCESS -> "图像缩放预处理失败"
+                    ERR_NCNN_EXTRACT -> "NCNN 推理或输出形状校验失败 (ret=$ret, dims=$dims, shape=${h}x${w}, 期望=8x5376)"
+                    ERR_RGBA_BUFFER -> "Direct RGBA 缓冲区或步长参数无效 (ret=$ret, dims=$dims, h=$h, w=$w)"
+                    ERR_NO_CACHE -> "无可用推理输出缓存"
+                    else -> "未知推理错误 ($code)"
+                }
+                return DetectionResult(false, msg, 0f, emptyList(), emptyList(), code)
+            }
+            if (header < 1f || raw.size < 4) {
+                return DetectionResult(false, "JNI 返回数据头不完整", 0f, emptyList(), emptyList(), -2)
+            }
+
+            val inferMs = raw[1].let { if (it.isFinite() && it >= 0f) it else 0f }
+            val trussCount = raw[2].safeRoundToInt().coerceAtLeast(0)
+            val fruitCount = raw[3].safeRoundToInt().coerceAtLeast(0)
+            val expectedSize = 4 + trussCount * 10 + fruitCount * 7
+            if (raw.size < expectedSize) {
+                return DetectionResult(
+                    false,
+                    "JNI 返回数据长度异常 (${raw.size} < $expectedSize)",
+                    inferMs,
+                    emptyList(),
+                    emptyList(),
+                    -3
+                )
+            }
+
+            var offset = 4
+            val trusses = ArrayList<TrussItem>(trussCount)
+            for (i in 0 until trussCount) {
+                trusses.add(
+                    TrussItem(
+                        id = i + 1,
+                        x1 = raw[offset],
+                        y1 = raw[offset + 1],
+                        x2 = raw[offset + 2],
+                        y2 = raw[offset + 3],
+                        conf = raw[offset + 4],
+                        ripeCount = raw[offset + 5].safeRoundToInt(),
+                        turningCount = raw[offset + 6].safeRoundToInt(),
+                        immatureCount = raw[offset + 7].safeRoundToInt(),
+                        gradeCode = raw[offset + 8].safeRoundToInt(),
+                        maturity = raw[offset + 9]
+                    )
+                )
+                offset += 10
+            }
+
+            val fruits = ArrayList<FruitItem>(fruitCount)
+            for (i in 0 until fruitCount) {
+                fruits.add(
+                    FruitItem(
+                        x1 = raw[offset],
+                        y1 = raw[offset + 1],
+                        x2 = raw[offset + 2],
+                        y2 = raw[offset + 3],
+                        conf = raw[offset + 4],
+                        cls = raw[offset + 5].safeRoundToInt(),
+                        parentTrussIndex = raw[offset + 6].safeRoundToInt(-1)
+                    )
+                )
+                offset += 7
+            }
+
+            return DetectionResult(true, "", inferMs, trusses, fruits, 0)
         }
     }
 
@@ -150,6 +267,8 @@ class YoloDetector {
 
     private external fun detectRgba(
         rgbaBuffer: ByteBuffer,
+        bufPos: Int,
+        bufLimit: Int,
         bufWidth: Int,
         bufHeight: Int,
         rowStride: Int,
@@ -172,7 +291,17 @@ class YoloDetector {
         assignNearestCenter: Boolean
     ): FloatArray?
 
+    private external fun clearCache()
+
     fun initialize(assetManager: AssetManager, useGpu: Boolean): InitResult {
+        ensureNativeLoaded()?.let { err ->
+            return InitResult(
+                success = false,
+                fallback = false,
+                activeBackend = "未加载",
+                reason = err
+            )
+        }
         val raw = initModel(assetManager, useGpu)
         val parts = raw.split("|", limit = 3)
         val status = parts.getOrElse(0) { "ERROR" }
@@ -187,6 +316,9 @@ class YoloDetector {
     }
 
     fun detectFrame(bitmap: Bitmap, config: DetectorConfig): DetectionResult {
+        ensureNativeLoaded()?.let { err ->
+            return DetectionResult(false, err, 0f, emptyList(), emptyList(), ERR_NATIVE_LOAD)
+        }
         val raw = detect(
             bitmap,
             config.confThresh,
@@ -210,8 +342,13 @@ class YoloDetector {
         mirrorHorizontal: Boolean,
         config: DetectorConfig
     ): DetectionResult {
+        ensureNativeLoaded()?.let { err ->
+            return DetectionResult(false, err, 0f, emptyList(), emptyList(), ERR_NATIVE_LOAD)
+        }
         val raw = detectRgba(
             rgbaBuffer,
+            rgbaBuffer.position(),
+            rgbaBuffer.limit(),
             bufWidth,
             bufHeight,
             rowStride,
@@ -230,6 +367,9 @@ class YoloDetector {
     }
 
     fun repostprocessCached(config: DetectorConfig): DetectionResult {
+        ensureNativeLoaded()?.let { err ->
+            return DetectionResult(false, err, 0f, emptyList(), emptyList(), ERR_NATIVE_LOAD)
+        }
         val raw = repostprocess(
             config.confThresh,
             config.iouThresh,
@@ -239,84 +379,11 @@ class YoloDetector {
         return parseDetectionResult(raw)
     }
 
-    private fun parseDetectionResult(raw: FloatArray?): DetectionResult {
-        if (raw == null || raw.isEmpty()) {
-            return DetectionResult(false, "JNI 返回空结果", 0f, emptyList(), emptyList(), -1)
+    fun clearNativeCache() {
+        if (!nativeLoaded) return
+        try {
+            clearCache()
+        } catch (_: UnsatisfiedLinkError) {
         }
-        if (raw[0] < 0f) {
-            val code = raw.getOrElse(1) { 0f }.roundToInt()
-            val ret = raw.getOrElse(2) { 0f }.roundToInt()
-            val dims = raw.getOrElse(3) { 0f }.roundToInt()
-            val h = raw.getOrElse(4) { 0f }.roundToInt()
-            val w = raw.getOrElse(5) { 0f }.roundToInt()
-            val msg = when (code) {
-                ERR_MODEL_NOT_LOADED -> "模型尚未加载完成"
-                ERR_BITMAP_INFO -> "无法读取 Bitmap 像素信息"
-                ERR_BITMAP_FORMAT -> "Bitmap 格式需为 RGBA_8888 (实际=$ret, ${w}x${h})"
-                ERR_PREPROCESS -> "图像缩放预处理失败"
-                ERR_NCNN_EXTRACT -> "NCNN 推理或输出形状校验失败 (ret=$ret, dims=$dims, shape=${h}x${w}, 期望=8x5376)"
-                ERR_RGBA_BUFFER -> "Direct RGBA 缓冲区或步长参数无效 (ret=$ret, cap=$h, stride=$w)"
-                ERR_NO_CACHE -> "无可用推理输出缓存"
-                else -> "未知推理错误 ($code)"
-            }
-            return DetectionResult(false, msg, 0f, emptyList(), emptyList(), code)
-        }
-        if (raw.size < 4) {
-            return DetectionResult(false, "JNI 返回数据头不完整", 0f, emptyList(), emptyList(), -2)
-        }
-
-        val inferMs = raw[1]
-        val trussCount = raw[2].roundToInt().coerceAtLeast(0)
-        val fruitCount = raw[3].roundToInt().coerceAtLeast(0)
-        val expectedSize = 4 + trussCount * 10 + fruitCount * 7
-        if (raw.size < expectedSize) {
-            return DetectionResult(
-                false,
-                "JNI 返回数据长度异常 (${raw.size} < $expectedSize)",
-                inferMs,
-                emptyList(),
-                emptyList(),
-                -3
-            )
-        }
-
-        var offset = 4
-        val trusses = ArrayList<TrussItem>(trussCount)
-        for (i in 0 until trussCount) {
-            trusses.add(
-                TrussItem(
-                    id = i + 1,
-                    x1 = raw[offset],
-                    y1 = raw[offset + 1],
-                    x2 = raw[offset + 2],
-                    y2 = raw[offset + 3],
-                    conf = raw[offset + 4],
-                    ripeCount = raw[offset + 5].roundToInt(),
-                    turningCount = raw[offset + 6].roundToInt(),
-                    immatureCount = raw[offset + 7].roundToInt(),
-                    gradeCode = raw[offset + 8].roundToInt(),
-                    maturity = raw[offset + 9]
-                )
-            )
-            offset += 10
-        }
-
-        val fruits = ArrayList<FruitItem>(fruitCount)
-        for (i in 0 until fruitCount) {
-            fruits.add(
-                FruitItem(
-                    x1 = raw[offset],
-                    y1 = raw[offset + 1],
-                    x2 = raw[offset + 2],
-                    y2 = raw[offset + 3],
-                    conf = raw[offset + 4],
-                    cls = raw[offset + 5].roundToInt(),
-                    parentTrussIndex = raw[offset + 6].roundToInt()
-                )
-            )
-            offset += 7
-        }
-
-        return DetectionResult(true, "", inferMs, trusses, fruits, 0)
     }
 }

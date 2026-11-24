@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -45,7 +52,15 @@ jobs:
 
           "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "$NDK_PKG"
 
+      - name: Cache NCNN Android Vulkan (20261020)
+        id: cache-ncnn
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/cpp/ncnn-android-vulkan
+          key: ncnn-android-vulkan-20261020-6e0c5f9b397faf32b923de2ef6210af9bf375851869dceff06a8005331981086
+
       - name: Download and verify NCNN Android Vulkan (20261020)
+        if: steps.cache-ncnn.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           curl -fL --retry 3 -o ncnn.zip "https://github.com/Tencent/ncnn/releases/download/20261020/ncnn-20261020-android-vulkan.zip"
@@ -57,10 +72,46 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build Debug APK
+      - name: Run Unit Tests and Build Debug APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug -PndkVersionOverride="$NDK_VER"
+          ./gradlew testDebugUnitTest assembleDebug -PndkVersionOverride="$NDK_VER"
+
+      - name: Verify 16 KB ELF Alignment in Debug APK
+        run: |
+          python3 - <<'PY'
+          import struct, zipfile
+
+          apk_path = "app/build/outputs/apk/debug/app-debug.apk"
+          with open(apk_path, "rb") as f:
+              apk_bytes = f.read()
+
+          with zipfile.ZipFile(apk_path, "r") as zf:
+              so_infos = [zi for zi in zf.infolist() if zi.filename.endswith(".so")]
+              assert so_infos, "No .so libraries found in APK"
+              for zi in so_infos:
+                  assert zi.compress_type == zipfile.ZIP_STORED, f"{zi.filename} is compressed!"
+                  lh_off = zi.header_offset
+                  sig = apk_bytes[lh_off:lh_off + 4]
+                  assert sig == b"PK\x03\x04", f"Bad local header for {zi.filename}"
+                  fname_len, extra_len = struct.unpack("<HH", apk_bytes[lh_off + 26:lh_off + 30])
+                  data_off = lh_off + 30 + fname_len + extra_len
+                  assert data_off % 16384 == 0, f"{zi.filename} ZIP data offset {data_off} not 16 KB aligned"
+
+                  elf = zf.read(zi.filename)
+                  assert elf[:4] == b"\x7fELF" and elf[4] == 2, f"{zi.filename} is not ELF64"
+                  e_phoff = struct.unpack("<Q", elf[32:40])[0]
+                  e_phentsize, e_phnum = struct.unpack("<HH", elf[54:58])
+                  pt_loads = []
+                  for i in range(e_phnum):
+                      off = e_phoff + i * e_phentsize
+                      p_type = struct.unpack("<I", elf[off:off + 4])[0]
+                      if p_type == 1:  # PT_LOAD
+                          p_align = struct.unpack("<Q", elf[off + 48:off + 56])[0]
+                          pt_loads.append(p_align)
+                          assert p_align >= 16384, f"{zi.filename} PT_LOAD[{i}] p_align={hex(p_align)} < 0x4000"
+                  print(f"OK {zi.filename}: zip_off%16k=0, PT_LOAD={[hex(a) for a in pt_loads]}")
+          PY
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4

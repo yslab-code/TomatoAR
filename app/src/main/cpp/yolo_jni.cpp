@@ -1,7 +1,6 @@
 #include <jni.h>
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
-#include <android/log.h>
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +26,9 @@ constexpr int kOutRows = 8;
 constexpr size_t kMaxPreNmsCandidates = 1024;
 constexpr size_t kMaxTrusses = 100;
 constexpr size_t kMaxFruits = 300;
+constexpr float kNormScale = 1.0f / 255.0f;
+constexpr float kPadNormValue = 114.0f / 255.0f;
+constexpr float kGpuProbeMaxClsDiff = 0.08f;
 
 struct CachedOutput {
     bool valid = false;
@@ -40,10 +42,12 @@ struct CachedOutput {
     std::vector<float> data;
 };
 
+// Allocators MUST be declared before g_yolo_net so reverse destruction destroys Net first.
 std::mutex g_mutex;
-ncnn::Net g_yolo_net;
 ncnn::PoolAllocator g_blob_pool_allocator;
 ncnn::PoolAllocator g_workspace_pool_allocator;
+ncnn::Net g_yolo_net;
+ncnn::Mat g_input_pad;
 bool g_model_loaded = false;
 bool g_gpu_active = false;
 bool g_gpu_instance_created = false;
@@ -67,6 +71,19 @@ struct TrussSummary {
     int grade_code = 0; // 0: 待检, 1: A, 2: B, 3: C, 4: D, 5: E
     float maturity = -1.0f;
 };
+
+void clear_runtime_state(bool clear_cached_data = false) {
+    g_yolo_net.clear();
+    g_input_pad.release();
+    g_blob_pool_allocator.clear();
+    g_workspace_pool_allocator.clear();
+    g_model_loaded = false;
+    g_gpu_active = false;
+    g_cached.valid = false;
+    if (clear_cached_data) {
+        std::vector<float>().swap(g_cached.data);
+    }
+}
 
 float box_iou(const DetBox& a, const DetBox& b) {
     const float ix1 = std::max(a.x1, b.x1);
@@ -119,14 +136,92 @@ int compute_grade_code(int ripe, int turning, int immature) {
 }
 
 std::string format_backend_label(bool use_gpu, bool enable_fp16, int cpu_threads, int big_cores) {
-    const std::string prec = enable_fp16 ? " (FP16)" : " (FP32)";
+    const std::string prec = enable_fp16 ? " (FP16存储)" : " (FP32)";
     if (use_gpu) {
         return "Vulkan GPU" + prec;
     }
-    if (big_cores >= 3) {
+    if (big_cores >= 2) {
         return "CPU " + std::to_string(cpu_threads) + "大核" + prec;
     }
     return "CPU " + std::to_string(cpu_threads) + "线程" + prec;
+}
+
+void build_gradient_probe(ncnn::Mat& probe_in) {
+    probe_in.create(kModelInputSize, kModelInputSize, 3);
+    for (int c = 0; c < 3; ++c) {
+        float* ptr = probe_in.channel(c);
+        for (int y = 0; y < kModelInputSize; ++y) {
+            float* row = ptr + y * kModelInputSize;
+            for (int x = 0; x < kModelInputSize; ++x) {
+                row[x] = static_cast<float>((y * 17 + x * 31 + c * 53) & 255) * kNormScale;
+            }
+        }
+    }
+}
+
+bool validate_probe_output(const ncnn::Mat& out, bool enable_fp16, std::string& err_msg) {
+    if (out.dims != 2 || out.h != kOutRows || out.w != kNumAnchors) {
+        err_msg = "模型输出形状异常: dims=" + std::to_string(out.dims) +
+                  " h=" + std::to_string(out.h) + " w=" + std::to_string(out.w) +
+                  " (期望 2D 8x5376)";
+        return false;
+    }
+    for (int r = 0; r < out.h; ++r) {
+        const float* row_ptr = out.row(r);
+        for (int c = 0; c < out.w; ++c) {
+            if (!std::isfinite(row_ptr[c])) {
+                err_msg = std::string(enable_fp16 ? "FP16" : "FP32") + " 试推理输出含 NaN/Inf";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool run_cpu_fp32_gradient_ref(
+        AAssetManager* mgr,
+        int cpu_threads,
+        const ncnn::Mat& grad_in,
+        ncnn::Mat& ref_out,
+        std::string& err_msg) {
+    ncnn::Net cpu_ref;
+    ncnn::Option ref_opt;
+    ref_opt.use_vulkan_compute = false;
+    ref_opt.num_threads = cpu_threads;
+    ref_opt.lightmode = true;
+    ref_opt.use_fp16_packed = false;
+    ref_opt.use_fp16_storage = false;
+    ref_opt.use_fp16_arithmetic = false;
+    ref_opt.use_bf16_packed = false;
+    ref_opt.use_bf16_storage = false;
+    cpu_ref.opt = ref_opt;
+
+    const int p_ret = cpu_ref.load_param(mgr, "best.ncnn.param");
+    if (p_ret != 0) {
+        err_msg = "Vulkan 参考 CPU 模型 load_param 失败 (ret=" + std::to_string(p_ret) + ")";
+        return false;
+    }
+    const int m_ret = cpu_ref.load_model(mgr, "best.ncnn.bin");
+    if (m_ret != 0) {
+        err_msg = "Vulkan 参考 CPU 模型 load_model 失败 (ret=" + std::to_string(m_ret) + ")";
+        return false;
+    }
+
+    ncnn::Extractor ref_ex = cpu_ref.create_extractor();
+    if (ref_ex.input("in0", grad_in) != 0) {
+        err_msg = "Vulkan 参考 CPU 模型输入节点 in0 绑定失败";
+        return false;
+    }
+    const int ex_ret = ref_ex.extract("out0", ref_out);
+    if (ex_ret != 0) {
+        err_msg = "Vulkan 参考 CPU 模型 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
+        return false;
+    }
+    if (!validate_probe_output(ref_out, false, err_msg)) {
+        err_msg = "Vulkan 参考 CPU 输出异常: " + err_msg;
+        return false;
+    }
+    return true;
 }
 
 bool load_and_probe(
@@ -134,18 +229,17 @@ bool load_and_probe(
         bool use_gpu,
         bool enable_fp16,
         std::string& err_msg,
-        std::string& backend_label) {
-    g_yolo_net.clear();
-    g_blob_pool_allocator.clear();
-    g_workspace_pool_allocator.clear();
-    g_model_loaded = false;
-    g_gpu_active = false;
-    g_cached.valid = false;
+        std::string& backend_label,
+        ncnn::Mat* cached_cpu_ref = nullptr) {
+    clear_runtime_state();
 
     if (use_gpu) {
 #if NCNN_VULKAN
         if (!g_gpu_instance_created) {
-            ncnn::create_gpu_instance();
+            if (ncnn::create_gpu_instance() != 0) {
+                err_msg = "Vulkan GPU 实例初始化失败";
+                return false;
+            }
             g_gpu_instance_created = true;
         }
         if (ncnn::get_gpu_count() <= 0) {
@@ -159,15 +253,10 @@ bool load_and_probe(
     }
 
     const int big_cores = ncnn::get_big_cpu_count();
-    const int little_cores = ncnn::get_little_cpu_count();
     const int total_cores = ncnn::get_cpu_count();
-    const int non_little_cores = (little_cores > 0 && total_cores > little_cores)
-            ? (total_cores - little_cores)
-            : total_cores;
-    const int cpu_threads = std::clamp(non_little_cores >= 3 ? non_little_cores : total_cores, 1, 4);
-    if (!use_gpu) {
-        ncnn::set_cpu_powersave(big_cores >= 3 ? 2 : 0);
-    }
+    const bool use_big_only = (big_cores >= 2);
+    const int cpu_threads = std::clamp(use_big_only ? big_cores : total_cores, 1, 4);
+    ncnn::set_cpu_powersave(use_big_only ? 2 : 0);
 
     ncnn::Option opt;
     opt.use_vulkan_compute = use_gpu;
@@ -177,7 +266,8 @@ bool load_and_probe(
     opt.workspace_allocator = &g_workspace_pool_allocator;
     opt.use_fp16_packed = enable_fp16;
     opt.use_fp16_storage = enable_fp16;
-    opt.use_fp16_arithmetic = enable_fp16;
+    // Keep FP32 accumulation for ScConv/SRU stability; FP16 packed+storage gives bandwidth gain safely.
+    opt.use_fp16_arithmetic = false;
     opt.use_bf16_packed = false;
     opt.use_bf16_storage = false;
     opt.use_packing_layout = true;
@@ -189,50 +279,93 @@ bool load_and_probe(
     const int p_ret = g_yolo_net.load_param(mgr, "best.ncnn.param");
     if (p_ret != 0) {
         err_msg = "load_param 失败 (ret=" + std::to_string(p_ret) + ")";
-        g_yolo_net.clear();
+        clear_runtime_state();
         return false;
     }
     const int m_ret = g_yolo_net.load_model(mgr, "best.ncnn.bin");
     if (m_ret != 0) {
         err_msg = "load_model 失败 (ret=" + std::to_string(m_ret) + ")";
-        g_yolo_net.clear();
+        clear_runtime_state();
         return false;
     }
 
-    // Dual-probe inference (0.0 and 0.5) to validate Vulkan/FP16 pipeline, shape, and finite math
-    const float probe_vals[2] = {0.0f, 0.5f};
-    for (float pv : probe_vals) {
-        ncnn::Mat probe_in(kModelInputSize, kModelInputSize, 3);
-        probe_in.fill(pv);
+    // 1. Zero-input probe
+    {
+        ncnn::Mat zero_in(kModelInputSize, kModelInputSize, 3);
+        zero_in.fill(0.0f);
         ncnn::Extractor ex = g_yolo_net.create_extractor();
-        if (ex.input("in0", probe_in) != 0) {
+        if (ex.input("in0", zero_in) != 0) {
             err_msg = "试推理输入节点 in0 绑定失败";
-            g_yolo_net.clear();
+            clear_runtime_state();
             return false;
         }
-        ncnn::Mat probe_out;
-        const int ex_ret = ex.extract("out0", probe_out);
+        ncnn::Mat zero_out;
+        const int ex_ret = ex.extract("out0", zero_out);
         if (ex_ret != 0) {
             err_msg = "试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
-            g_yolo_net.clear();
+            clear_runtime_state();
             return false;
         }
-        if (probe_out.dims != 2 || probe_out.h != kOutRows || probe_out.w != kNumAnchors) {
-            err_msg = "模型输出形状异常: dims=" + std::to_string(probe_out.dims) +
-                      " h=" + std::to_string(probe_out.h) + " w=" + std::to_string(probe_out.w) +
-                      " (期望 2D 8x5376)";
-            g_yolo_net.clear();
+        if (!validate_probe_output(zero_out, enable_fp16, err_msg)) {
+            clear_runtime_state();
             return false;
         }
-        for (int r = 0; r < probe_out.h; ++r) {
-            const float* row_ptr = probe_out.row(r);
-            for (int c = 0; c < probe_out.w; ++c) {
-                if (!std::isfinite(row_ptr[c])) {
-                    err_msg = std::string(enable_fp16 ? "FP16" : "FP32") + " 试推理输出含 NaN/Inf";
-                    g_yolo_net.clear();
-                    return false;
+    }
+
+    // 2. Non-uniform gradient/stripe probe (+ CPU FP32 cross-check when Vulkan is active)
+    ncnn::Mat grad_in;
+    build_gradient_probe(grad_in);
+    ncnn::Mat grad_out;
+    {
+        ncnn::Extractor ex = g_yolo_net.create_extractor();
+        if (ex.input("in0", grad_in) != 0) {
+            err_msg = "梯度试推理输入节点 in0 绑定失败";
+            clear_runtime_state();
+            return false;
+        }
+        const int ex_ret = ex.extract("out0", grad_out);
+        if (ex_ret != 0) {
+            err_msg = "梯度试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
+            clear_runtime_state();
+            return false;
+        }
+        if (!validate_probe_output(grad_out, enable_fp16, err_msg)) {
+            clear_runtime_state();
+            return false;
+        }
+    }
+
+    if (use_gpu) {
+        ncnn::Mat local_ref;
+        const ncnn::Mat* ref_ptr = nullptr;
+        if (cached_cpu_ref && !cached_cpu_ref->empty()) {
+            ref_ptr = cached_cpu_ref;
+        } else {
+            if (!run_cpu_fp32_gradient_ref(mgr, cpu_threads, grad_in, local_ref, err_msg)) {
+                clear_runtime_state();
+                return false;
+            }
+            if (cached_cpu_ref) {
+                *cached_cpu_ref = local_ref;
+            }
+            ref_ptr = &local_ref;
+        }
+
+        float max_cls_diff = 0.0f;
+        for (int r = 4; r < kOutRows; ++r) {
+            const float* g_row = grad_out.row(r);
+            const float* c_row = ref_ptr->row(r);
+            for (int a = 0; a < kNumAnchors; ++a) {
+                const float diff = std::abs(g_row[a] - c_row[a]);
+                if (diff > max_cls_diff) {
+                    max_cls_diff = diff;
                 }
             }
+        }
+        if (!std::isfinite(max_cls_diff) || max_cls_diff > kGpuProbeMaxClsDiff) {
+            err_msg = "Vulkan 数值校验偏差过大 (diff=" + std::to_string(max_cls_diff) + ")";
+            clear_runtime_state();
+            return false;
         }
     }
 
@@ -251,54 +384,115 @@ jfloatArray make_error_array(JNIEnv* env, float code, float ret = 0.0f, float di
     return arr;
 }
 
-ncnn::Mat rotate_and_mirror_chw(const ncnn::Mat& src, int rot_deg, bool mirror_horizontal) {
-    if (src.empty() || src.c != 3) {
-        return ncnn::Mat();
-    }
-    if (rot_deg == 0 && !mirror_horizontal) {
-        return src;
-    }
-    const int src_w = src.w;
-    const int src_h = src.h;
-    const int dst_w = (rot_deg == 90 || rot_deg == 270) ? src_h : src_w;
-    const int dst_h = (rot_deg == 90 || rot_deg == 270) ? src_w : src_h;
+void fill_letterbox_borders(float* plane, int active_left, int active_top, int active_w, int active_h) {
+    const int active_right = active_left + active_w;
+    const int active_bottom = active_top + active_h;
 
-    ncnn::Mat dst(dst_w, dst_h, 3);
-    if (dst.empty()) {
-        return ncnn::Mat();
+    for (int y = 0; y < active_top; ++y) {
+        std::fill_n(plane + y * kModelInputSize, kModelInputSize, kPadNormValue);
+    }
+    for (int y = active_top; y < active_bottom; ++y) {
+        float* row = plane + y * kModelInputSize;
+        if (active_left > 0) {
+            std::fill_n(row, active_left, kPadNormValue);
+        }
+        if (active_right < kModelInputSize) {
+            std::fill_n(row + active_right, kModelInputSize - active_right, kPadNormValue);
+        }
+    }
+    for (int y = active_bottom; y < kModelInputSize; ++y) {
+        std::fill_n(plane + y * kModelInputSize, kModelInputSize, kPadNormValue);
+    }
+}
+
+// Fuses rotate/mirror + letterbox border padding + 1/255 normalization into a reusable 512x512x3 Mat.
+bool fill_letterbox_input(
+        const ncnn::Mat& pre_rot,
+        int rot_deg,
+        bool mirror_horizontal,
+        int pad_left,
+        int pad_top,
+        ncnn::Mat& out_pad) {
+    if (pre_rot.empty() || pre_rot.c != 3) {
+        return false;
+    }
+    const int src_w = pre_rot.w;
+    const int src_h = pre_rot.h;
+    const bool swap_wh = (rot_deg == 90 || rot_deg == 270);
+    const int dst_w = swap_wh ? src_h : src_w;
+    const int dst_h = swap_wh ? src_w : src_h;
+
+    if (pad_left < 0 || pad_top < 0 ||
+        pad_left + dst_w > kModelInputSize ||
+        pad_top + dst_h > kModelInputSize) {
+        return false;
+    }
+
+    if (out_pad.empty() || out_pad.dims != 3 ||
+        out_pad.w != kModelInputSize || out_pad.h != kModelInputSize || out_pad.c != 3) {
+        out_pad.create(kModelInputSize, kModelInputSize, 3);
+        if (out_pad.empty()) {
+            return false;
+        }
     }
 
     const int mode = ((rot_deg / 90) & 3) * 2 + (mirror_horizontal ? 1 : 0);
+    constexpr int kTile = 16;
+
     for (int c = 0; c < 3; ++c) {
-        const float* sptr = src.channel(c);
-        float* dptr = dst.channel(c);
+        const float* sptr = pre_rot.channel(c);
+        float* dptr = out_pad.channel(c);
+        fill_letterbox_borders(dptr, pad_left, pad_top, dst_w, dst_h);
+
         switch (mode) {
+            case 0: { // rot 0
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    float* drow = dptr + (pad_top + sy) * kModelInputSize + pad_left;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        drow[sx] = srow[sx] * kNormScale;
+                    }
+                }
+                break;
+            }
             case 1: { // rot 0 + mirror
                 for (int sy = 0; sy < src_h; ++sy) {
                     const float* srow = sptr + sy * src_w;
-                    float* drow = dptr + sy * dst_w;
+                    float* drow = dptr + (pad_top + sy) * kModelInputSize + pad_left;
                     for (int sx = 0; sx < src_w; ++sx) {
-                        drow[dst_w - 1 - sx] = srow[sx];
+                        drow[dst_w - 1 - sx] = srow[sx] * kNormScale;
                     }
                 }
                 break;
             }
-            case 2: { // rot 90
-                for (int sy = 0; sy < src_h; ++sy) {
-                    const float* srow = sptr + sy * src_w;
-                    const int dx = src_h - 1 - sy;
-                    for (int sx = 0; sx < src_w; ++sx) {
-                        dptr[sx * dst_w + dx] = srow[sx];
+            case 2: { // rot 90 (cache-blocked)
+                for (int sy0 = 0; sy0 < src_h; sy0 += kTile) {
+                    const int sy1 = std::min(sy0 + kTile, src_h);
+                    for (int sx0 = 0; sx0 < src_w; sx0 += kTile) {
+                        const int sx1 = std::min(sx0 + kTile, src_w);
+                        for (int sy = sy0; sy < sy1; ++sy) {
+                            const float* srow = sptr + sy * src_w;
+                            const int dcol = pad_left + (src_h - 1 - sy);
+                            for (int sx = sx0; sx < sx1; ++sx) {
+                                dptr[(pad_top + sx) * kModelInputSize + dcol] = srow[sx] * kNormScale;
+                            }
+                        }
                     }
                 }
                 break;
             }
-            case 3: { // rot 90 + mirror
-                for (int sy = 0; sy < src_h; ++sy) {
-                    const float* srow = sptr + sy * src_w;
-                    const int dx = sy;
-                    for (int sx = 0; sx < src_w; ++sx) {
-                        dptr[sx * dst_w + dx] = srow[sx];
+            case 3: { // rot 90 + mirror (cache-blocked)
+                for (int sy0 = 0; sy0 < src_h; sy0 += kTile) {
+                    const int sy1 = std::min(sy0 + kTile, src_h);
+                    for (int sx0 = 0; sx0 < src_w; sx0 += kTile) {
+                        const int sx1 = std::min(sx0 + kTile, src_w);
+                        for (int sy = sy0; sy < sy1; ++sy) {
+                            const float* srow = sptr + sy * src_w;
+                            const int dcol = pad_left + sy;
+                            for (int sx = sx0; sx < sx1; ++sx) {
+                                dptr[(pad_top + sx) * kModelInputSize + dcol] = srow[sx] * kNormScale;
+                            }
+                        }
                     }
                 }
                 break;
@@ -306,9 +500,9 @@ ncnn::Mat rotate_and_mirror_chw(const ncnn::Mat& src, int rot_deg, bool mirror_h
             case 4: { // rot 180
                 for (int sy = 0; sy < src_h; ++sy) {
                     const float* srow = sptr + sy * src_w;
-                    float* drow = dptr + (src_h - 1 - sy) * dst_w;
+                    float* drow = dptr + (pad_top + (src_h - 1 - sy)) * kModelInputSize + pad_left;
                     for (int sx = 0; sx < src_w; ++sx) {
-                        drow[src_w - 1 - sx] = srow[sx];
+                        drow[src_w - 1 - sx] = srow[sx] * kNormScale;
                     }
                 }
                 break;
@@ -316,133 +510,153 @@ ncnn::Mat rotate_and_mirror_chw(const ncnn::Mat& src, int rot_deg, bool mirror_h
             case 5: { // rot 180 + mirror
                 for (int sy = 0; sy < src_h; ++sy) {
                     const float* srow = sptr + sy * src_w;
-                    float* drow = dptr + (src_h - 1 - sy) * dst_w;
-                    std::memcpy(drow, srow, static_cast<size_t>(src_w) * sizeof(float));
-                }
-                break;
-            }
-            case 6: { // rot 270
-                for (int sy = 0; sy < src_h; ++sy) {
-                    const float* srow = sptr + sy * src_w;
-                    const int dx = sy;
+                    float* drow = dptr + (pad_top + (src_h - 1 - sy)) * kModelInputSize + pad_left;
                     for (int sx = 0; sx < src_w; ++sx) {
-                        dptr[(src_w - 1 - sx) * dst_w + dx] = srow[sx];
+                        drow[sx] = srow[sx] * kNormScale;
                     }
                 }
                 break;
             }
-            case 7: { // rot 270 + mirror
-                for (int sy = 0; sy < src_h; ++sy) {
-                    const float* srow = sptr + sy * src_w;
-                    const int dx = src_h - 1 - sy;
-                    for (int sx = 0; sx < src_w; ++sx) {
-                        dptr[(src_w - 1 - sx) * dst_w + dx] = srow[sx];
+            case 6: { // rot 270 (cache-blocked)
+                for (int sy0 = 0; sy0 < src_h; sy0 += kTile) {
+                    const int sy1 = std::min(sy0 + kTile, src_h);
+                    for (int sx0 = 0; sx0 < src_w; sx0 += kTile) {
+                        const int sx1 = std::min(sx0 + kTile, src_w);
+                        for (int sy = sy0; sy < sy1; ++sy) {
+                            const float* srow = sptr + sy * src_w;
+                            const int dcol = pad_left + sy;
+                            for (int sx = sx0; sx < sx1; ++sx) {
+                                dptr[(pad_top + (src_w - 1 - sx)) * kModelInputSize + dcol] = srow[sx] * kNormScale;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case 7: { // rot 270 + mirror (cache-blocked)
+                for (int sy0 = 0; sy0 < src_h; sy0 += kTile) {
+                    const int sy1 = std::min(sy0 + kTile, src_h);
+                    for (int sx0 = 0; sx0 < src_w; sx0 += kTile) {
+                        const int sx1 = std::min(sx0 + kTile, src_w);
+                        for (int sy = sy0; sy < sy1; ++sy) {
+                            const float* srow = sptr + sy * src_w;
+                            const int dcol = pad_left + (src_h - 1 - sy);
+                            for (int sx = sx0; sx < sx1; ++sx) {
+                                dptr[(pad_top + (src_w - 1 - sx)) * kModelInputSize + dcol] = srow[sx] * kNormScale;
+                            }
+                        }
                     }
                 }
                 break;
             }
             default:
-                break;
+                return false;
         }
     }
-    return dst;
+    return true;
 }
 
-bool run_net_and_cache(
-        const ncnn::Mat& resized_rgb,
+bool run_net(
+        const ncnn::Mat& pre_rot,
+        int rot_deg,
+        bool mirror_horizontal,
         int upright_w,
         int upright_h,
         int pad_left,
-        int pad_right,
         int pad_top,
-        int pad_bottom,
         float scale_x,
         float scale_y,
+        bool save_cache,
         const std::chrono::steady_clock::time_point& t_start,
+        ncnn::Mat& out_mat,
+        float& out_net_ms,
         float& out_ret,
         float& out_dims,
         float& out_h,
         float& out_w) {
-    if (resized_rgb.empty()) {
+    if (!fill_letterbox_input(pre_rot, rot_deg, mirror_horizontal, pad_left, pad_top, g_input_pad)) {
         out_ret = -2.0f;
         return false;
     }
 
-    ncnn::Mat in_pad;
-    ncnn::copy_make_border(resized_rgb, in_pad, pad_top, pad_bottom, pad_left, pad_right,
-                           ncnn::BORDER_CONSTANT, 114.0f, g_yolo_net.opt);
-    if (in_pad.empty() || in_pad.w != kModelInputSize || in_pad.h != kModelInputSize) {
-        out_ret = -3.0f;
-        return false;
-    }
-    const float norm_vals[3] = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
-    in_pad.substract_mean_normalize(nullptr, norm_vals);
-
     ncnn::Extractor ex = g_yolo_net.create_extractor();
-    if (ex.input("in0", in_pad) != 0) {
+    if (ex.input("in0", g_input_pad) != 0) {
         out_ret = -1.0f;
         out_dims = 0.0f;
         out_h = 0.0f;
         out_w = 0.0f;
         return false;
     }
-    ncnn::Mat out;
-    const int ex_ret = ex.extract("out0", out);
-    if (ex_ret != 0 || out.dims != 2 || out.h != kOutRows || out.w != kNumAnchors) {
+    const int ex_ret = ex.extract("out0", out_mat);
+    if (ex_ret != 0 || out_mat.dims != 2 || out_mat.h != kOutRows || out_mat.w != kNumAnchors) {
         out_ret = static_cast<float>(ex_ret);
-        out_dims = static_cast<float>(out.dims);
-        out_h = static_cast<float>(out.h);
-        out_w = static_cast<float>(out.w);
+        out_dims = static_cast<float>(out_mat.dims);
+        out_h = static_cast<float>(out_mat.h);
+        out_w = static_cast<float>(out_mat.w);
         return false;
     }
 
-    g_cached.data.resize(static_cast<size_t>(kOutRows) * static_cast<size_t>(kNumAnchors));
-    for (int r = 0; r < kOutRows; ++r) {
-        std::memcpy(
-                g_cached.data.data() + static_cast<size_t>(r) * static_cast<size_t>(kNumAnchors),
-                out.row(r),
-                static_cast<size_t>(kNumAnchors) * sizeof(float));
-    }
-    g_cached.img_w = upright_w;
-    g_cached.img_h = upright_h;
-    g_cached.scale_x = scale_x;
-    g_cached.scale_y = scale_y;
-    g_cached.pad_left = pad_left;
-    g_cached.pad_top = pad_top;
     const auto t_net_end = std::chrono::steady_clock::now();
-    g_cached.infer_ms = std::chrono::duration<float, std::milli>(t_net_end - t_start).count();
-    g_cached.valid = true;
+    out_net_ms = std::chrono::duration<float, std::milli>(t_net_end - t_start).count();
+
+    if (save_cache) {
+        g_cached.data.resize(static_cast<size_t>(kOutRows) * static_cast<size_t>(kNumAnchors));
+        for (int r = 0; r < kOutRows; ++r) {
+            std::memcpy(
+                    g_cached.data.data() + static_cast<size_t>(r) * static_cast<size_t>(kNumAnchors),
+                    out_mat.row(r),
+                    static_cast<size_t>(kNumAnchors) * sizeof(float));
+        }
+        g_cached.img_w = upright_w;
+        g_cached.img_h = upright_h;
+        g_cached.scale_x = scale_x;
+        g_cached.scale_y = scale_y;
+        g_cached.pad_left = pad_left;
+        g_cached.pad_top = pad_top;
+        g_cached.infer_ms = out_net_ms;
+        g_cached.valid = true;
+    } else {
+        g_cached.valid = false;
+    }
     return true;
 }
 
 jfloatArray postprocess_and_pack(
         JNIEnv* env,
-        const CachedOutput& cached,
+        const float* rows[kOutRows],
+        int img_w,
+        int img_h,
+        float scale_x,
+        float scale_y,
+        int pad_left,
+        int pad_top,
+        float base_infer_ms,
         float conf_thresh,
         float iou_thresh,
         bool agnostic_fruit_nms,
-        bool assign_nearest_center,
-        const std::chrono::steady_clock::time_point& t_start) {
-    const float* row_cx = cached.data.data() + 0 * kNumAnchors;
-    const float* row_cy = cached.data.data() + 1 * kNumAnchors;
-    const float* row_bw = cached.data.data() + 2 * kNumAnchors;
-    const float* row_bh = cached.data.data() + 3 * kNumAnchors;
-    const float* row_c0 = cached.data.data() + 4 * kNumAnchors;
-    const float* row_c1 = cached.data.data() + 5 * kNumAnchors;
-    const float* row_c2 = cached.data.data() + 6 * kNumAnchors;
-    const float* row_c3 = cached.data.data() + 7 * kNumAnchors;
+        bool assign_nearest_center) {
+    const auto t_post_start = std::chrono::steady_clock::now();
+
+    const float* row_cx = rows[0];
+    const float* row_cy = rows[1];
+    const float* row_bw = rows[2];
+    const float* row_bh = rows[3];
+    const float* row_c0 = rows[4];
+    const float* row_c1 = rows[5];
+    const float* row_c2 = rows[6];
+    const float* row_c3 = rows[7];
 
     std::vector<DetBox> truss_cands;
     std::vector<DetBox> fruit_cands;
     truss_cands.reserve(64);
     fruit_cands.reserve(256);
 
-    const float fw = static_cast<float>(cached.img_w);
-    const float fh = static_cast<float>(cached.img_h);
-    const float f_pad_l = static_cast<float>(cached.pad_left);
-    const float f_pad_t = static_cast<float>(cached.pad_top);
-    const float inv_sx = cached.scale_x > 0.0f ? (1.0f / cached.scale_x) : 1.0f;
-    const float inv_sy = cached.scale_y > 0.0f ? (1.0f / cached.scale_y) : 1.0f;
+    const float fw = static_cast<float>(img_w);
+    const float fh = static_cast<float>(img_h);
+    const float f_pad_l = static_cast<float>(pad_left);
+    const float f_pad_t = static_cast<float>(pad_top);
+    const float inv_sx = scale_x > 0.0f ? (1.0f / scale_x) : 1.0f;
+    const float inv_sy = scale_y > 0.0f ? (1.0f / scale_y) : 1.0f;
 
     for (int i = 0; i < kNumAnchors; ++i) {
         const float s0 = row_c0[i];
@@ -450,17 +664,34 @@ jfloatArray postprocess_and_pack(
         const float s2 = row_c2[i];
         const float s3 = row_c3[i];
 
-        if (!std::isfinite(s0) || !std::isfinite(s1) || !std::isfinite(s2) || !std::isfinite(s3)) {
-            continue;
+        const bool want_truss = (s0 >= conf_thresh) && std::isfinite(s0);
+
+        int best_fruit_cls = -1;
+        float best_fruit_score = -1.0f;
+        bool want_any_fruit = false;
+
+        if (agnostic_fruit_nms) {
+            if (s1 >= conf_thresh && std::isfinite(s1) && s1 > best_fruit_score) {
+                best_fruit_score = s1;
+                best_fruit_cls = 1;
+            }
+            if (s2 >= conf_thresh && std::isfinite(s2) && s2 > best_fruit_score) {
+                best_fruit_score = s2;
+                best_fruit_cls = 2;
+            }
+            if (s3 >= conf_thresh && std::isfinite(s3) && s3 > best_fruit_score) {
+                best_fruit_score = s3;
+                best_fruit_cls = 3;
+            }
+            want_any_fruit = (best_fruit_cls > 0);
+        } else {
+            want_any_fruit =
+                    (s1 >= conf_thresh && std::isfinite(s1)) ||
+                    (s2 >= conf_thresh && std::isfinite(s2)) ||
+                    (s3 >= conf_thresh && std::isfinite(s3));
         }
 
-        int best_cls = 0;
-        float best_score = s0;
-        if (s1 > best_score) { best_score = s1; best_cls = 1; }
-        if (s2 > best_score) { best_score = s2; best_cls = 2; }
-        if (s3 > best_score) { best_score = s3; best_cls = 3; }
-
-        if (best_score < conf_thresh) {
+        if (!want_truss && !want_any_fruit) {
             continue;
         }
 
@@ -480,11 +711,23 @@ jfloatArray postprocess_and_pack(
             continue;
         }
 
-        DetBox box{x1, y1, x2, y2, best_score, best_cls, -1};
-        if (best_cls == 0) {
-            truss_cands.push_back(box);
-        } else {
-            fruit_cands.push_back(box);
+        if (want_truss) {
+            truss_cands.push_back(DetBox{x1, y1, x2, y2, s0, 0, -1});
+        }
+        if (want_any_fruit) {
+            if (agnostic_fruit_nms) {
+                fruit_cands.push_back(DetBox{x1, y1, x2, y2, best_fruit_score, best_fruit_cls, -1});
+            } else {
+                if (s1 >= conf_thresh && std::isfinite(s1)) {
+                    fruit_cands.push_back(DetBox{x1, y1, x2, y2, s1, 1, -1});
+                }
+                if (s2 >= conf_thresh && std::isfinite(s2)) {
+                    fruit_cands.push_back(DetBox{x1, y1, x2, y2, s2, 2, -1});
+                }
+                if (s3 >= conf_thresh && std::isfinite(s3)) {
+                    fruit_cands.push_back(DetBox{x1, y1, x2, y2, s3, 3, -1});
+                }
+            }
         }
     }
 
@@ -502,9 +745,13 @@ jfloatArray postprocess_and_pack(
     if (trusses.size() > kMaxTrusses) {
         trusses.resize(kMaxTrusses);
     }
+    // Strict weak ordering: quantized column bucket, then exact y1, then exact x1.
     std::sort(trusses.begin(), trusses.end(), [](const DetBox& a, const DetBox& b) {
-        if (std::abs(a.x1 - b.x1) > 1.0f) return a.x1 < b.x1;
-        return a.y1 < b.y1;
+        const int bx_a = static_cast<int>(std::floor(a.x1));
+        const int bx_b = static_cast<int>(std::floor(b.x1));
+        if (bx_a != bx_b) return bx_a < bx_b;
+        if (a.y1 != b.y1) return a.y1 < b.y1;
+        return a.x1 < b.x1;
     });
 
     std::vector<DetBox> fruits;
@@ -572,13 +819,14 @@ jfloatArray postprocess_and_pack(
                 : -1.0f;
     }
 
-    const auto t_end = std::chrono::steady_clock::now();
-    const float infer_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    const auto t_post_end = std::chrono::steady_clock::now();
+    const float post_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
+    const float total_infer_ms = std::max(0.0f, base_infer_ms + post_ms);
 
     std::vector<float> packed;
     packed.reserve(4 + summaries.size() * 10 + fruits.size() * 7);
     packed.push_back(1.0f);
-    packed.push_back(infer_ms);
+    packed.push_back(total_infer_ms);
     packed.push_back(static_cast<float>(summaries.size()));
     packed.push_back(static_cast<float>(fruits.size()));
 
@@ -620,12 +868,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_yolo_net.clear();
-    g_blob_pool_allocator.clear();
-    g_workspace_pool_allocator.clear();
-    g_model_loaded = false;
-    g_cached.valid = false;
-    g_cached.data.clear();
+    clear_runtime_state(true);
 #if NCNN_VULKAN
     if (g_gpu_instance_created) {
         ncnn::destroy_gpu_instance();
@@ -645,13 +888,14 @@ Java_com_hzau_tomatoar_YoloDetector_initModel(
 
     std::string backend;
     if (use_gpu == JNI_TRUE) {
+        ncnn::Mat gpu_cpu_ref;
         std::string gpu_fp16_err;
-        if (load_and_probe(mgr, true, true, gpu_fp16_err, backend)) {
+        if (load_and_probe(mgr, true, true, gpu_fp16_err, backend, &gpu_cpu_ref)) {
             const std::string resp = "OK|" + backend + "|";
             return env->NewStringUTF(resp.c_str());
         }
         std::string gpu_fp32_err;
-        if (load_and_probe(mgr, true, false, gpu_fp32_err, backend)) {
+        if (load_and_probe(mgr, true, false, gpu_fp32_err, backend, &gpu_cpu_ref)) {
             const std::string resp = "OK|" + backend + "|";
             return env->NewStringUTF(resp.c_str());
         }
@@ -704,6 +948,9 @@ Java_com_hzau_tomatoar_YoloDetector_detect(
 
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
         return make_error_array(env, 2.0f);
     }
     if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0) {
@@ -717,30 +964,40 @@ Java_com_hzau_tomatoar_YoloDetector_detect(
     const int img_h = static_cast<int>(info.height);
     const float scale = std::min(static_cast<float>(kModelInputSize) / static_cast<float>(img_w),
                                  static_cast<float>(kModelInputSize) / static_cast<float>(img_h));
-    const int new_w = std::max(1, static_cast<int>(std::lround(img_w * scale)));
-    const int new_h = std::max(1, static_cast<int>(std::lround(img_h * scale)));
+    const int new_w = std::clamp(static_cast<int>(std::lround(img_w * scale)), 1, kModelInputSize);
+    const int new_h = std::clamp(static_cast<int>(std::lround(img_h * scale)), 1, kModelInputSize);
     const int pad_left = (kModelInputSize - new_w) / 2;
-    const int pad_right = kModelInputSize - new_w - pad_left;
     const int pad_top = (kModelInputSize - new_h) / 2;
-    const int pad_bottom = kModelInputSize - new_h - pad_top;
     const float scale_x = static_cast<float>(new_w) / static_cast<float>(img_w);
     const float scale_y = static_cast<float>(new_h) / static_cast<float>(img_h);
 
     ncnn::Mat in = ncnn::Mat::from_android_bitmap_resize(
             env, bitmap, ncnn::Mat::PIXEL_RGB, new_w, new_h);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return make_error_array(env, 4.0f);
+    }
     if (in.empty()) {
         return make_error_array(env, 4.0f);
     }
 
+    ncnn::Mat out_mat;
+    float net_ms = 0.0f;
     float err_ret = 0.0f, err_dims = 0.0f, err_h = 0.0f, err_w = 0.0f;
-    if (!run_net_and_cache(in, img_w, img_h, pad_left, pad_right, pad_top, pad_bottom,
-                           scale_x, scale_y, t_start, err_ret, err_dims, err_h, err_w)) {
+    if (!run_net(in, 0, false, img_w, img_h, pad_left, pad_top,
+                 scale_x, scale_y, true, t_start, out_mat, net_ms,
+                 err_ret, err_dims, err_h, err_w)) {
         return make_error_array(env, 5.0f, err_ret, err_dims, err_h, err_w);
     }
 
+    const float* rows[kOutRows];
+    for (int r = 0; r < kOutRows; ++r) {
+        rows[r] = g_cached.data.data() + static_cast<size_t>(r) * static_cast<size_t>(kNumAnchors);
+    }
     return postprocess_and_pack(
-            env, g_cached, conf_thresh, iou_thresh,
-            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE, t_start);
+            env, rows, img_w, img_h, scale_x, scale_y, pad_left, pad_top, net_ms,
+            conf_thresh, iou_thresh,
+            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
@@ -748,6 +1005,8 @@ Java_com_hzau_tomatoar_YoloDetector_detectRgba(
         JNIEnv* env,
         jobject thiz,
         jobject rgba_buffer,
+        jint buf_pos,
+        jint buf_limit,
         jint buf_w,
         jint buf_h,
         jint row_stride,
@@ -772,11 +1031,19 @@ Java_com_hzau_tomatoar_YoloDetector_detectRgba(
         return make_error_array(env, 6.0f, static_cast<float>(rotation_degrees));
     }
 
-    if (!rgba_buffer || buf_w <= 0 || buf_h <= 0 ||
-        crop_w <= 0 || crop_h <= 0 ||
-        crop_left < 0 || crop_top < 0 ||
-        crop_left + crop_w > buf_w || crop_top + crop_h > buf_h ||
-        row_stride < buf_w * 4) {
+    const int64_t bw64 = static_cast<int64_t>(buf_w);
+    const int64_t bh64 = static_cast<int64_t>(buf_h);
+    const int64_t cl64 = static_cast<int64_t>(crop_left);
+    const int64_t ct64 = static_cast<int64_t>(crop_top);
+    const int64_t cw64 = static_cast<int64_t>(crop_w);
+    const int64_t ch64 = static_cast<int64_t>(crop_h);
+    const int64_t stride64 = static_cast<int64_t>(row_stride);
+
+    if (!rgba_buffer || bw64 <= 0 || bh64 <= 0 ||
+        cw64 <= 0 || ch64 <= 0 ||
+        cl64 < 0 || ct64 < 0 ||
+        cl64 + cw64 > bw64 || ct64 + ch64 > bh64 ||
+        stride64 < bw64 * 4LL) {
         return make_error_array(env, 6.0f, static_cast<float>(row_stride), 0.0f,
                                 static_cast<float>(buf_h), static_cast<float>(buf_w));
     }
@@ -787,12 +1054,19 @@ Java_com_hzau_tomatoar_YoloDetector_detectRgba(
         return make_error_array(env, 6.0f, -1.0f);
     }
 
-    const int64_t last_row = static_cast<int64_t>(crop_top) + static_cast<int64_t>(crop_h) - 1;
-    const int64_t last_row_bytes = static_cast<int64_t>(crop_left + crop_w) * 4LL;
-    const int64_t required_bytes = last_row * static_cast<int64_t>(row_stride) + last_row_bytes;
-    if (required_bytes > static_cast<int64_t>(cap)) {
+    const int64_t pos64 = static_cast<int64_t>(buf_pos);
+    const int64_t limit64 = static_cast<int64_t>(buf_limit);
+    if (pos64 < 0 || limit64 < pos64 || limit64 > static_cast<int64_t>(cap)) {
+        return make_error_array(env, 6.0f, -2.0f, static_cast<float>(pos64),
+                                static_cast<float>(limit64), static_cast<float>(cap));
+    }
+
+    const int64_t last_row = ct64 + ch64 - 1;
+    const int64_t last_row_bytes = (cl64 + cw64) * 4LL;
+    const int64_t required_bytes = last_row * stride64 + last_row_bytes;
+    if (pos64 + required_bytes > limit64) {
         return make_error_array(env, 6.0f, static_cast<float>(required_bytes), 0.0f,
-                                static_cast<float>(cap), static_cast<float>(row_stride));
+                                static_cast<float>(limit64 - pos64), static_cast<float>(row_stride));
     }
 
     const auto t_start = std::chrono::steady_clock::now();
@@ -803,19 +1077,17 @@ Java_com_hzau_tomatoar_YoloDetector_detectRgba(
 
     const float scale = std::min(static_cast<float>(kModelInputSize) / static_cast<float>(upright_w),
                                  static_cast<float>(kModelInputSize) / static_cast<float>(upright_h));
-    const int new_w = std::max(1, static_cast<int>(std::lround(upright_w * scale)));
-    const int new_h = std::max(1, static_cast<int>(std::lround(upright_h * scale)));
+    const int new_w = std::clamp(static_cast<int>(std::lround(upright_w * scale)), 1, kModelInputSize);
+    const int new_h = std::clamp(static_cast<int>(std::lround(upright_h * scale)), 1, kModelInputSize);
     const int pad_left = (kModelInputSize - new_w) / 2;
-    const int pad_right = kModelInputSize - new_w - pad_left;
     const int pad_top = (kModelInputSize - new_h) / 2;
-    const int pad_bottom = kModelInputSize - new_h - pad_top;
     const float scale_x = static_cast<float>(new_w) / static_cast<float>(upright_w);
     const float scale_y = static_cast<float>(new_h) / static_cast<float>(upright_h);
 
     const int pre_rot_w = swap_wh ? new_h : new_w;
     const int pre_rot_h = swap_wh ? new_w : new_h;
 
-    const auto* pixels = static_cast<const unsigned char*>(raw_ptr);
+    const auto* pixels = static_cast<const unsigned char*>(raw_ptr) + pos64;
     ncnn::Mat pre_rot = ncnn::Mat::from_pixels_roi_resize(
             pixels,
             ncnn::Mat::PIXEL_RGBA2RGB,
@@ -827,25 +1099,29 @@ Java_com_hzau_tomatoar_YoloDetector_detectRgba(
             crop_w,
             crop_h,
             pre_rot_w,
-            pre_rot_h);
+            pre_rot_h,
+            g_yolo_net.opt.blob_allocator);
     if (pre_rot.empty()) {
         return make_error_array(env, 4.0f);
     }
 
-    ncnn::Mat upright_rgb = rotate_and_mirror_chw(pre_rot, rot, mirror_horizontal == JNI_TRUE);
-    if (upright_rgb.empty()) {
-        return make_error_array(env, 4.0f);
-    }
-
+    ncnn::Mat out_mat;
+    float net_ms = 0.0f;
     float err_ret = 0.0f, err_dims = 0.0f, err_h = 0.0f, err_w = 0.0f;
-    if (!run_net_and_cache(upright_rgb, upright_w, upright_h, pad_left, pad_right, pad_top, pad_bottom,
-                           scale_x, scale_y, t_start, err_ret, err_dims, err_h, err_w)) {
+    if (!run_net(pre_rot, rot, mirror_horizontal == JNI_TRUE, upright_w, upright_h,
+                 pad_left, pad_top, scale_x, scale_y, false, t_start,
+                 out_mat, net_ms, err_ret, err_dims, err_h, err_w)) {
         return make_error_array(env, 5.0f, err_ret, err_dims, err_h, err_w);
     }
 
+    const float* rows[kOutRows];
+    for (int r = 0; r < kOutRows; ++r) {
+        rows[r] = out_mat.row(r);
+    }
     return postprocess_and_pack(
-            env, g_cached, conf_thresh, iou_thresh,
-            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE, t_start);
+            env, rows, upright_w, upright_h, scale_x, scale_y, pad_left, pad_top, net_ms,
+            conf_thresh, iou_thresh,
+            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
@@ -865,8 +1141,22 @@ Java_com_hzau_tomatoar_YoloDetector_repostprocess(
         return make_error_array(env, 7.0f);
     }
 
-    const auto t_start = std::chrono::steady_clock::now();
+    const float* rows[kOutRows];
+    for (int r = 0; r < kOutRows; ++r) {
+        rows[r] = g_cached.data.data() + static_cast<size_t>(r) * static_cast<size_t>(kNumAnchors);
+    }
     return postprocess_and_pack(
-            env, g_cached, conf_thresh, iou_thresh,
-            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE, t_start);
+            env, rows, g_cached.img_w, g_cached.img_h,
+            g_cached.scale_x, g_cached.scale_y, g_cached.pad_left, g_cached.pad_top,
+            g_cached.infer_ms,
+            conf_thresh, iou_thresh,
+            agnostic_fruit_nms == JNI_TRUE, assign_nearest_center == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hzau_tomatoar_YoloDetector_clearCache(JNIEnv* env, jobject thiz) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_cached.valid = false;
+    std::vector<float>().swap(g_cached.data);
+    g_input_pad.release();
 }

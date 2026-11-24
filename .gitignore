@@ -9,5 +9,12 @@ captures/
 .externalNativeBuild/
 .cxx/
 app/src/main/cpp/ncnn-android-vulkan/
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+ncnn*.zip
+*.hprof
 !gradle/wrapper/gradle-wrapper.jar
 !app/src/main/assets/*

@@ -23,11 +23,21 @@ find_package(ncnn REQUIRED)
 
 add_library(dgtruss_yolo SHARED yolo_jni.cpp)
 
-target_link_options(dgtruss_yolo PRIVATE "-Wl,-z,max-page-size=16384")
+target_compile_options(dgtruss_yolo PRIVATE
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_link_options(dgtruss_yolo PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,--gc-sections"
+    "-Wl,--exclude-libs,ALL"
+)
 
 target_link_libraries(dgtruss_yolo
     ncnn
     android
     jnigraphics
-    log
 )

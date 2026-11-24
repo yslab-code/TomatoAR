@@ -7,17 +7,23 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
-import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Rational
 import android.util.Size
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
@@ -52,6 +58,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.doOnLayout
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.io.FileOutputStream
@@ -59,7 +67,9 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
@@ -85,13 +95,18 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val detector = YoloDetector()
+    private val analyzerExecutor = Executors.newSingleThreadExecutor()
     private val inferenceExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private val activeSessionId = AtomicLong(1L)
     private val imageTokenGenerator = AtomicLong(1L)
     private val cachedBitmapToken = AtomicLong(0L)
     private val freezeRequested = AtomicBoolean(false)
     private val reDetectSeq = AtomicLong(0L)
+    private val initSeq = AtomicLong(0L)
+    private val modelInitInProgress = AtomicBoolean(false)
 
     @Volatile private var mode: AppMode = AppMode.LIVE
     @Volatile private var config: DetectorConfig = DetectorConfig()
@@ -103,22 +118,35 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lockedSnapshot: FrameSnapshot? = null
     @Volatile private var measuredFps = 0f
 
-    // FPS tracking owned exclusively by inferenceExecutor
+    // FPS tracking owned exclusively by analyzerExecutor
     private var fpsSessionId = -1L
     private var fpsWindowStartNs = 0L
     private var fpsFrameCount = 0
 
+    // Reusable non-direct fallback scratch (owned exclusively by analyzerExecutor)
+    private var fallbackTightBuffer: ByteBuffer? = null
+    private var fallbackRowScratch: ByteArray? = null
+
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private var cameraProvider: ProcessCameraProvider? = null
+    private var currentImageAnalysis: ImageAnalysis? = null
+
     private var selectedTrussIndex: Int? = null
-    private var selectedTrussBox: RectF? = null
+    private var selectedTrussNormBox: NormBox? = null
     private var techCardExpanded = false
     private var summaryExpanded = false
     private var settingsVisible = false
     private var pendingSaveAfterPermission = false
     private var summaryScrollMaxHeightPx = 0
+    private var isHdRefining = false
+    private var isExporting = false
+    private var isSummaryScrolling = false
+    private var lastLiveDrawerUpdateMs = 0L
+    private var pendingReDetectRunnable: Runnable? = null
+    private var selectableRowBgResId = 0
 
     // Views
+    private lateinit var rootContainer: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var frozenImageView: ImageView
     private lateinit var arOverlayView: ArOverlayView
@@ -162,6 +190,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSaveResult: Button
 
     private lateinit var settingsBackdrop: FrameLayout
+    private lateinit var settingsSheet: LinearLayout
     private lateinit var settingsScrollView: ScrollView
     private lateinit var btnCloseSettings: ImageButton
     private lateinit var switchShowFruitBoxes: SwitchCompat
@@ -189,8 +218,12 @@ class MainActivity : AppCompatActivity() {
                     startCamera()
                 }
             } else {
-                Toast.makeText(this, "未授予相机权限，已切换为样本图/相册测图模式", Toast.LENGTH_LONG).show()
-                loadBuiltInSample()
+                if (lockedSnapshot == null) {
+                    Toast.makeText(this, "未授予相机权限，已切换为样本图/相册测图模式", Toast.LENGTH_LONG).show()
+                    loadBuiltInSample()
+                } else {
+                    Toast.makeText(this, "未授予相机权限，保持当前图像模式", Toast.LENGTH_SHORT).show()
+                }
             }
         }
 
@@ -222,8 +255,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
         setContentView(R.layout.activity_main)
+
+        val tv = TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackground, tv, true)) {
+            selectableRowBgResId = tv.resourceId
+        }
 
         config = loadPersistedConfig()
         bindViews()
@@ -242,19 +283,74 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        freezeRequested.set(false)
+        cancelPendingReDetect()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        cancelPendingReDetect()
         freezeRequested.set(false)
-        cameraProvider?.unbindAll()
+        activeSessionId.incrementAndGet()
+        unbindCameraSafely()
+        analyzerExecutor.shutdownNow()
         inferenceExecutor.shutdownNow()
-        ioExecutor.shutdownNow()
+        safeExecute(ioExecutor) {
+            runCatching { detector.clearNativeCache() }
+        }
+        ioExecutor.shutdown()
+    }
+
+    private fun safeExecute(executor: ExecutorService, block: () -> Unit): Boolean {
+        if (executor.isShutdown || executor.isTerminated) {
+            return false
+        }
+        return try {
+            executor.execute(block)
+            true
+        } catch (_: RejectedExecutionException) {
+            false
+        }
+    }
+
+    private fun unbindCameraSafely() {
+        try {
+            currentImageAnalysis?.clearAnalyzer()
+        } catch (_: Exception) {
+        }
+        currentImageAnalysis = null
+        try {
+            cameraProvider?.unbindAll()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun cancelPendingReDetect() {
+        pendingReDetectRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingReDetectRunnable = null
+    }
+
+    private fun scheduleDebouncedReDetect() {
+        cancelPendingReDetect()
+        val runnable = Runnable {
+            pendingReDetectRunnable = null
+            if (!isDestroyed && !isFinishing && mode != AppMode.LIVE) {
+                reDetectLockedSnapshot(forceFullInfer = false)
+            }
+        }
+        pendingReDetectRunnable = runnable
+        mainHandler.postDelayed(runnable, 40L)
     }
 
     private fun loadPersistedConfig(): DetectorConfig {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val rawConf = prefs.getFloat(KEY_CONF_THRESH, 0.35f)
+        val rawIou = prefs.getFloat(KEY_IOU_THRESH, 0.70f)
         return DetectorConfig(
-            confThresh = prefs.getFloat(KEY_CONF_THRESH, 0.35f).coerceIn(0.10f, 0.85f),
-            iouThresh = prefs.getFloat(KEY_IOU_THRESH, 0.70f).coerceIn(0.30f, 0.90f),
+            confThresh = (if (rawConf.isFinite()) rawConf else 0.35f).coerceIn(0.10f, 0.85f),
+            iouThresh = (if (rawIou.isFinite()) rawIou else 0.70f).coerceIn(0.30f, 0.90f),
             agnosticFruitNms = prefs.getBoolean(KEY_AGNOSTIC_NMS, true),
             assignNearestCenter = prefs.getBoolean(KEY_ASSIGN_NEAREST, true),
             showFruitBoxes = prefs.getBoolean(KEY_SHOW_FRUIT_BOXES, true),
@@ -279,15 +375,18 @@ class MainActivity : AppCompatActivity() {
             .apply()
     }
 
-    private inline fun updateConfig(transform: (DetectorConfig) -> DetectorConfig) {
+    private inline fun updateConfig(persist: Boolean = true, transform: (DetectorConfig) -> DetectorConfig) {
         val next = transform(config)
         if (next != config) {
             config = next
-            saveConfig(next)
+            if (persist) {
+                saveConfig(next)
+            }
         }
     }
 
     private fun bindViews() {
+        rootContainer = findViewById(R.id.rootContainer)
         previewView = findViewById(R.id.previewView)
         frozenImageView = findViewById(R.id.frozenImageView)
         arOverlayView = findViewById(R.id.arOverlayView)
@@ -331,6 +430,7 @@ class MainActivity : AppCompatActivity() {
         btnSaveResult = findViewById(R.id.btnSaveResult)
 
         settingsBackdrop = findViewById(R.id.settingsBackdrop)
+        settingsSheet = findViewById(R.id.settingsSheet)
         settingsScrollView = findViewById(R.id.settingsScrollView)
         btnCloseSettings = findViewById(R.id.btnCloseSettings)
         switchShowFruitBoxes = findViewById(R.id.switchShowFruitBoxes)
@@ -355,23 +455,57 @@ class MainActivity : AppCompatActivity() {
     private fun applyWindowInsets() {
         val dm = resources.displayMetrics
         val dp = dm.density
-        val screenH = dm.heightPixels
-        summaryScrollMaxHeightPx = min((220f * dp).roundToInt(), (screenH * 0.30f).roundToInt())
-        val settingsScrollH = min((420f * dp).roundToInt(), (screenH * 0.56f).roundToInt())
-        settingsScrollView.layoutParams = settingsScrollView.layoutParams.apply {
-            height = settingsScrollH
+        var lastBarsTop = 0
+        var lastBarsBottom = 0
+
+        fun updateOverlayAndSheetHeights() {
+            val containerH = rootContainer.height.takeIf { it > 0 } ?: dm.heightPixels
+            val usableH = (containerH - lastBarsTop - lastBarsBottom).coerceAtLeast((240f * dp).roundToInt())
+            summaryScrollMaxHeightPx = min((220f * dp).roundToInt(), (usableH * 0.30f).roundToInt())
+            val settingsScrollH = min((420f * dp).roundToInt(), (usableH * 0.56f).roundToInt())
+            if (settingsScrollView.layoutParams.height != settingsScrollH) {
+                settingsScrollView.layoutParams = settingsScrollView.layoutParams.apply {
+                    height = settingsScrollH
+                }
+            }
+            val topSafe = max(lastBarsTop.toFloat() + 66f * dp, topHudContainer.bottom.toFloat())
+            val bottomSafe = if (rootContainer.height > 0 && bottomStack.top > 0) {
+                (rootContainer.height - bottomStack.top).coerceAtLeast(lastBarsBottom).toFloat()
+            } else {
+                lastBarsBottom.toFloat() + 180f * dp
+            }
+            arOverlayView.setSafeInsetsPx(topSafe, bottomSafe)
         }
 
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.rootContainer)) { _, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+        ViewCompat.setOnApplyWindowInsetsListener(rootContainer) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            lastBarsTop = bars.top
+            lastBarsBottom = bars.bottom
             val topPad = bars.top + (10f * dp).roundToInt()
             val sidePad = (14f * dp).roundToInt()
             val bottomPad = bars.bottom + (16f * dp).roundToInt()
             topHudContainer.setPadding(sidePad, topPad, sidePad, 0)
             bottomStack.setPadding(sidePad, 0, sidePad, bottomPad)
-            arOverlayView.setSafeTopInsetPx(bars.top + 66f * dp)
+
+            val sheetSidePad = (18f * dp).roundToInt()
+            settingsSheet.setPadding(
+                sheetSidePad,
+                (14f * dp).roundToInt(),
+                sheetSidePad,
+                bars.bottom + (22f * dp).roundToInt()
+            )
+            updateOverlayAndSheetHeights()
             insets
         }
+
+        val layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            updateOverlayAndSheetHeights()
+        }
+        rootContainer.addOnLayoutChangeListener(layoutListener)
+        topHudContainer.addOnLayoutChangeListener(layoutListener)
+        bottomStack.addOnLayoutChangeListener(layoutListener)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -395,7 +529,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         arOverlayView.onTrussSelectedListener = { idx ->
-            setSelectedTruss(idx, activeResult())
+            val size = activeSourceSize()
+            if (size != null) {
+                setSelectedTruss(idx, activeResult(), size.first, size.second)
+            } else {
+                clearSelectedTruss()
+            }
             if (idx != null && summaryExpanded) {
                 summaryExpanded = false
                 updateSummaryExpandedUi()
@@ -409,15 +548,33 @@ class MainActivity : AppCompatActivity() {
             redrawActiveOverlay()
         }
 
+        summaryScrollView.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> isSummaryScrolling = true
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isSummaryScrolling = false
+            }
+            false
+        }
+
         var pillTouchStartY = 0f
-        btnSummaryPill.setOnTouchListener { _, ev ->
-            when (ev.action) {
+        btnSummaryPill.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> pillTouchStartY = ev.rawY
+                MotionEvent.ACTION_CANCEL -> {
+                    v.isPressed = false
+                }
                 MotionEvent.ACTION_UP -> {
                     val dy = ev.rawY - pillTouchStartY
-                    val swipeThreshold = -24f * resources.displayMetrics.density
-                    if (dy < swipeThreshold && !summaryExpanded) {
+                    val swipeThreshold = 24f * resources.displayMetrics.density
+                    if (dy < -swipeThreshold && !summaryExpanded) {
+                        v.isPressed = false
                         summaryExpanded = true
+                        updateSummaryExpandedUi()
+                        return@setOnTouchListener true
+                    }
+                    if (dy > swipeThreshold && summaryExpanded) {
+                        v.isPressed = false
+                        summaryExpanded = false
                         updateSummaryExpandedUi()
                         return@setOnTouchListener true
                     }
@@ -439,7 +596,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             val liveState = latestLiveState
-            if (liveState == null) {
+            if (liveState == null || liveState.sessionId != activeSessionId.get()) {
                 Toast.makeText(this, "等待首帧检测完成…", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
@@ -491,6 +648,7 @@ class MainActivity : AppCompatActivity() {
         switchShowFruitBoxes.setOnCheckedChangeListener { _, isChecked ->
             if (config.showFruitBoxes != isChecked) {
                 updateConfig { it.copy(showFruitBoxes = isChecked) }
+                updateFruitLabelToggleState(isChecked)
                 redrawActiveOverlay()
             }
         }
@@ -507,20 +665,26 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Detection SeekBars
+        // Detection SeekBars (persist only on release; debounce re-postprocess while dragging)
         seekConf.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 val v = 0.10f + progress / 100f
                 tvConfValue.text = String.format(Locale.US, "%.2f", v)
                 if (fromUser) {
-                    updateConfig { it.copy(confThresh = v) }
+                    updateConfig(persist = false) { it.copy(confThresh = v) }
                     if (mode != AppMode.LIVE) {
-                        reDetectLockedSnapshot(forceFullInfer = false)
+                        scheduleDebouncedReDetect()
                     }
                 }
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                saveConfig(config)
+                if (mode != AppMode.LIVE && pendingReDetectRunnable != null) {
+                    cancelPendingReDetect()
+                    reDetectLockedSnapshot(forceFullInfer = false)
+                }
+            }
         })
 
         seekIou.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -528,14 +692,20 @@ class MainActivity : AppCompatActivity() {
                 val v = 0.30f + progress / 100f
                 tvIouValue.text = String.format(Locale.US, "%.2f", v)
                 if (fromUser) {
-                    updateConfig { it.copy(iouThresh = v) }
+                    updateConfig(persist = false) { it.copy(iouThresh = v) }
                     if (mode != AppMode.LIVE) {
-                        reDetectLockedSnapshot(forceFullInfer = false)
+                        scheduleDebouncedReDetect()
                     }
                 }
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                saveConfig(config)
+                if (mode != AppMode.LIVE && pendingReDetectRunnable != null) {
+                    cancelPendingReDetect()
+                    reDetectLockedSnapshot(forceFullInfer = false)
+                }
+            }
         })
 
         btnFruitNmsAgnostic.setOnClickListener {
@@ -627,14 +797,20 @@ class MainActivity : AppCompatActivity() {
         summaryExpandedCard.visibility = if (summaryExpanded) View.VISIBLE else View.GONE
         ivSummaryChevron.setImageResource(if (summaryExpanded) R.drawable.ic_chevron_down else R.drawable.ic_chevron_up)
         if (summaryExpanded) {
-            populateSummaryDrawer(activeResult())
+            populateSummaryDrawer(activeResult(), force = true)
         }
+    }
+
+    private fun updateFruitLabelToggleState(fruitBoxesEnabled: Boolean) {
+        switchShowFruitLabels.isEnabled = fruitBoxesEnabled
+        switchShowFruitLabels.alpha = if (fruitBoxesEnabled) 1.0f else 0.45f
     }
 
     private fun syncSettingsUi() {
         val cfg = config
         switchShowFruitBoxes.isChecked = cfg.showFruitBoxes
         switchShowFruitLabels.isChecked = cfg.showFruitLabels
+        updateFruitLabelToggleState(cfg.showFruitBoxes)
         switchLargeText.isChecked = cfg.largeTextForGlasses
 
         tvConfValue.text = String.format(Locale.US, "%.2f", cfg.confThresh)
@@ -658,8 +834,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun styleSegmentButton(btn: Button, active: Boolean) {
+        btn.isSelected = active
         btn.setBackgroundResource(if (active) R.drawable.bg_pill_segment_active else R.drawable.bg_pill_segment_inactive)
         btn.setTextColor(ContextCompat.getColor(this, if (active) R.color.black else R.color.white))
+        btn.setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
     }
 
     private fun changeResolution(index: Int) {
@@ -698,24 +876,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun initializeModelAsync(useGpu: Boolean, reRunFrozenAfterInit: Boolean) {
         modelReady = false
+        modelInitInProgress.set(true)
+        val seq = initSeq.incrementAndGet()
         activeBackendLabel = if (useGpu) "正在切换 Vulkan GPU…" else "正在初始化 CPU…"
         backendFallbackNotice = ""
         lastFrameError = ""
         updateStatusCapsuleUi()
+        renderCurrentSnapshotDetails()
         if (techCardExpanded) {
             refreshTechHudFromActiveState()
         }
 
         val targetSession = activeSessionId.get()
-        inferenceExecutor.execute {
-            val initRes = initModelOnInferenceThread(useGpu)
+        val submitted = safeExecute(inferenceExecutor) {
+            val initRes = try {
+                initModelOnInferenceThread(useGpu)
+            } finally {
+                modelInitInProgress.set(false)
+            }
             runOnUiThread {
-                if (isDestroyed || isFinishing) return@runOnUiThread
+                if (isDestroyed || isFinishing || seq != initSeq.get()) return@runOnUiThread
                 applyInitUiFeedback(initRes, showSuccessFallbackToast = true)
                 if (reRunFrozenAfterInit && initRes.success && targetSession == activeSessionId.get() && mode != AppMode.LIVE) {
                     reDetectLockedSnapshot(forceFullInfer = true)
                 }
             }
+        }
+        if (!submitted) {
+            modelInitInProgress.set(false)
         }
     }
 
@@ -730,6 +918,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "模型加载失败：${initRes.reason}", Toast.LENGTH_LONG).show()
         }
         updateStatusCapsuleUi()
+        renderCurrentSnapshotDetails()
         if (techCardExpanded) {
             refreshTechHudFromActiveState()
         }
@@ -758,7 +947,11 @@ class MainActivity : AppCompatActivity() {
     private fun capturePreviewSnapshot(rawPreviewBmp: Bitmap, liveState: LiveFrameState) {
         val cropped = cropBitmapToAspect(rawPreviewBmp, liveState.srcWidth, liveState.srcHeight)
         val argbBmp = if (cropped.config != Bitmap.Config.ARGB_8888) {
-            cropped.copy(Bitmap.Config.ARGB_8888, false).also { cropped.recycle() }
+            try {
+                cropped.copy(Bitmap.Config.ARGB_8888, false)?.also { cropped.recycle() } ?: cropped
+            } catch (_: OutOfMemoryError) {
+                cropped
+            }
         } else {
             cropped
         }
@@ -766,7 +959,7 @@ class MainActivity : AppCompatActivity() {
         val targetSession = activeSessionId.incrementAndGet()
         freezeRequested.set(false)
         val token = imageTokenGenerator.incrementAndGet()
-        val scaledResult = scaleResultCoordinates(
+        val scaledResult = TrussGeometry.scaleDetectionCoordinates(
             liveState.result,
             liveState.srcWidth,
             liveState.srcHeight,
@@ -776,32 +969,45 @@ class MainActivity : AppCompatActivity() {
         val initialSnap = FrameSnapshot(targetSession, token, argbBmp, scaledResult)
         lockedSnapshot = initialSnap
         mode = AppMode.FROZEN
-        cameraProvider?.unbindAll()
+        unbindCameraSafely()
+        isHdRefining = true
         updateModeUi()
         renderSnapshot(initialSnap)
-        btnSaveResult.isEnabled = false
+        updateSaveButtonState()
 
-        val cfgCopy = config
-        inferenceExecutor.execute {
+        val submitted = safeExecute(inferenceExecutor) {
             if (!modelReady || targetSession != activeSessionId.get()) {
                 runOnUiThread {
-                    if (!isDestroyed && !isFinishing) btnSaveResult.isEnabled = true
+                    if (!isDestroyed && !isFinishing) {
+                        isHdRefining = false
+                        updateSaveButtonState()
+                    }
                 }
-                return@execute
+                return@safeExecute
             }
+            val cfgCopy = config
             val hdResult = detector.detectFrame(argbBmp, cfgCopy)
             if (hdResult.success) {
                 cachedBitmapToken.set(token)
             }
-            val hdSnap = FrameSnapshot(targetSession, token, argbBmp, hdResult)
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
-                btnSaveResult.isEnabled = true
+                isHdRefining = false
                 if (targetSession == activeSessionId.get() && mode == AppMode.FROZEN) {
-                    lockedSnapshot = hdSnap
-                    renderSnapshot(hdSnap)
+                    if (hdResult.success) {
+                        val hdSnap = FrameSnapshot(targetSession, token, argbBmp, hdResult)
+                        lockedSnapshot = hdSnap
+                        renderSnapshot(hdSnap)
+                    } else {
+                        Toast.makeText(this, "高精度复检失败，已保留实时定格结果", Toast.LENGTH_SHORT).show()
+                    }
                 }
+                updateSaveButtonState()
             }
+        }
+        if (!submitted) {
+            isHdRefining = false
+            updateSaveButtonState()
         }
     }
 
@@ -825,32 +1031,15 @@ class MainActivity : AppCompatActivity() {
         }
         val left = ((src.width - cropW) / 2).coerceIn(0, (src.width - cropW).coerceAtLeast(0))
         val top = ((src.height - cropH) / 2).coerceIn(0, (src.height - cropH).coerceAtLeast(0))
-        val out = Bitmap.createBitmap(src, left, top, cropW, cropH)
-        if (out !== src) {
-            src.recycle()
+        return try {
+            val out = Bitmap.createBitmap(src, left, top, cropW, cropH)
+            if (out !== src) {
+                src.recycle()
+            }
+            out
+        } catch (_: OutOfMemoryError) {
+            src
         }
-        return out
-    }
-
-    private fun scaleResultCoordinates(
-        res: DetectionResult,
-        fromW: Int,
-        fromH: Int,
-        toW: Int,
-        toH: Int
-    ): DetectionResult {
-        if (!res.success || fromW <= 0 || fromH <= 0 || (fromW == toW && fromH == toH)) {
-            return res
-        }
-        val sx = toW.toFloat() / fromW.toFloat()
-        val sy = toH.toFloat() / fromH.toFloat()
-        val scaledTrusses = res.trusses.map { t ->
-            t.copy(x1 = t.x1 * sx, y1 = t.y1 * sy, x2 = t.x2 * sx, y2 = t.y2 * sy)
-        }
-        val scaledFruits = res.fruits.map { f ->
-            f.copy(x1 = f.x1 * sx, y1 = f.y1 * sy, x2 = f.x2 * sx, y2 = f.y2 * sy)
-        }
-        return res.copy(trusses = scaledTrusses, fruits = scaledFruits)
     }
 
     private fun startCamera() {
@@ -871,8 +1060,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindCameraUseCases() {
         val provider = cameraProvider ?: return
-        previewView.post {
-            if (isDestroyed || isFinishing || mode != AppMode.LIVE) return@post
+        previewView.doOnLayout {
+            if (isDestroyed || isFinishing || mode != AppMode.LIVE) return@doOnLayout
+            if (previewView.width <= 0 || previewView.height <= 0) {
+                previewView.post {
+                    if (!isDestroyed && !isFinishing && mode == AppMode.LIVE) {
+                        bindCameraUseCases()
+                    }
+                }
+                return@doOnLayout
+            }
 
             val previewTargetSize = targetResolutionSize()
             val analysisTarget = analysisTargetSize()
@@ -917,9 +1114,11 @@ class MainActivity : AppCompatActivity() {
             val boundSession = activeSessionId.get()
             val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
 
-            imageAnalysis.setAnalyzer(inferenceExecutor) { imageProxy ->
+            imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
                 try {
-                    if (mode != AppMode.LIVE || !modelReady || boundSession != activeSessionId.get()) {
+                    if (mode != AppMode.LIVE || !modelReady || modelInitInProgress.get() ||
+                        boundSession != activeSessionId.get()
+                    ) {
                         return@setAnalyzer
                     }
                     val cfgCopy = config
@@ -957,7 +1156,7 @@ class MainActivity : AppCompatActivity() {
                             if (mode == AppMode.LIVE && snap.sessionId == activeSessionId.get()) {
                                 lockedSnapshot = snap
                                 mode = AppMode.FROZEN
-                                cameraProvider?.unbindAll()
+                                unbindCameraSafely()
                                 updateModeUi()
                                 renderSnapshot(snap)
                             } else {
@@ -1017,11 +1216,11 @@ class MainActivity : AppCompatActivity() {
                         return@setAnalyzer
                     }
 
-                    updateFpsOnInferenceThread(boundSession)
+                    updateFpsOnAnalyzerThread(boundSession)
                     val state = LiveFrameState(boundSession, uprightW, uprightH, result)
-                    latestLiveState = state
                     runOnUiThread {
                         if (!isDestroyed && !isFinishing && mode == AppMode.LIVE && state.sessionId == activeSessionId.get()) {
+                            latestLiveState = state
                             renderLiveState(state)
                         }
                     }
@@ -1043,15 +1242,17 @@ class MainActivity : AppCompatActivity() {
                 .build()
 
             try {
-                provider.unbindAll()
+                unbindCameraSafely()
+                currentImageAnalysis = imageAnalysis
                 provider.bindToLifecycle(this, selector, group)
             } catch (e: Exception) {
+                currentImageAnalysis = null
                 Toast.makeText(this, "摄像头绑定失败：${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
 
-    private fun updateFpsOnInferenceThread(sessionId: Long) {
+    private fun updateFpsOnAnalyzerThread(sessionId: Long) {
         val nowNs = System.nanoTime()
         if (fpsSessionId != sessionId || fpsWindowStartNs == 0L) {
             fpsSessionId = sessionId
@@ -1081,61 +1282,85 @@ class MainActivity : AppCompatActivity() {
         val buffer = plane.buffer
         buffer.rewind()
 
-        val rawBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        if (rowStride == tightRowBytes && buffer.remaining() >= tightRowBytes * h) {
-            rawBmp.copyPixelsFromBuffer(buffer)
-        } else {
-            val tightBuffer = ByteBuffer.allocateDirect(tightRowBytes * h)
-            val rowTmp = ByteArray(tightRowBytes)
-            for (y in 0 until h) {
-                val rowOffset = y * rowStride
-                if (rowOffset + tightRowBytes > buffer.limit()) {
-                    rawBmp.recycle()
-                    return null
+        return try {
+            val rawBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            if (rowStride == tightRowBytes && buffer.remaining() >= tightRowBytes * h) {
+                rawBmp.copyPixelsFromBuffer(buffer)
+            } else {
+                val neededBytes = tightRowBytes * h
+                var tightBuffer = fallbackTightBuffer
+                if (tightBuffer == null || tightBuffer.capacity() < neededBytes) {
+                    tightBuffer = ByteBuffer.allocateDirect(neededBytes)
+                    fallbackTightBuffer = tightBuffer
                 }
-                buffer.position(rowOffset)
-                buffer.get(rowTmp, 0, tightRowBytes)
-                tightBuffer.put(rowTmp)
+                tightBuffer.clear()
+
+                var rowTmp = fallbackRowScratch
+                if (rowTmp == null || rowTmp.size < tightRowBytes) {
+                    rowTmp = ByteArray(tightRowBytes)
+                    fallbackRowScratch = rowTmp
+                }
+
+                for (y in 0 until h) {
+                    val rowOffset = y * rowStride
+                    if (rowOffset + tightRowBytes > buffer.limit()) {
+                        rawBmp.recycle()
+                        return null
+                    }
+                    buffer.position(rowOffset)
+                    buffer.get(rowTmp, 0, tightRowBytes)
+                    tightBuffer.put(rowTmp, 0, tightRowBytes)
+                }
+                tightBuffer.rewind()
+                rawBmp.copyPixelsFromBuffer(tightBuffer)
             }
-            tightBuffer.rewind()
-            rawBmp.copyPixelsFromBuffer(tightBuffer)
-        }
 
-        val crop = imageProxy.cropRect
-        val cropLeft = crop.left.coerceIn(0, w - 1)
-        val cropTop = crop.top.coerceIn(0, h - 1)
-        val cropW = crop.width().coerceIn(1, w - cropLeft)
-        val cropH = crop.height().coerceIn(1, h - cropTop)
+            val crop = imageProxy.cropRect
+            val cropLeft = crop.left.coerceIn(0, w - 1)
+            val cropTop = crop.top.coerceIn(0, h - 1)
+            val cropW = crop.width().coerceIn(1, w - cropLeft)
+            val cropH = crop.height().coerceIn(1, h - cropTop)
 
-        val matrix = Matrix()
-        val rot = imageProxy.imageInfo.rotationDegrees
-        if (rot != 0) {
-            matrix.postRotate(rot.toFloat())
-        }
-        if (mirrorHorizontal) {
-            matrix.postScale(-1f, 1f)
-        }
+            val matrix = Matrix()
+            val rot = imageProxy.imageInfo.rotationDegrees
+            if (rot != 0) {
+                matrix.postRotate(rot.toFloat())
+            }
+            if (mirrorHorizontal) {
+                matrix.postScale(-1f, 1f)
+            }
 
-        val upright = Bitmap.createBitmap(rawBmp, cropLeft, cropTop, cropW, cropH, matrix, true)
-        if (upright !== rawBmp) {
-            rawBmp.recycle()
+            val upright = Bitmap.createBitmap(rawBmp, cropLeft, cropTop, cropW, cropH, matrix, true)
+            if (upright !== rawBmp) {
+                rawBmp.recycle()
+            }
+            upright
+        } catch (_: OutOfMemoryError) {
+            null
+        } catch (_: Exception) {
+            null
         }
-        return upright
     }
 
     private fun openGalleryPicker() {
         try {
             photoPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         } catch (_: Exception) {
-            legacyDocumentPickerLauncher.launch(arrayOf("image/*"))
+            try {
+                legacyDocumentPickerLauncher.launch(arrayOf("image/*"))
+            } catch (_: Exception) {
+                Toast.makeText(this, "当前设备未找到可用的系统图库选择器", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
     private fun prepareAlbumSession(loadingText: String): Long {
+        cancelPendingReDetect()
         resetSessionAndPerf()
         val targetSession = activeSessionId.get()
         mode = AppMode.ALBUM
-        cameraProvider?.unbindAll()
+        isHdRefining = false
+        unbindCameraSafely()
         lockedSnapshot = null
         clearSelectedTruss()
         frozenImageView.setImageDrawable(null)
@@ -1148,17 +1373,26 @@ class MainActivity : AppCompatActivity() {
     private fun loadBuiltInSample() {
         val targetSession = prepareAlbumSession("正在分析内置样本图…")
 
-        inferenceExecutor.execute {
+        safeExecute(ioExecutor) {
+            if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
+                return@safeExecute
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
             val bmp = try {
                 assets.open("sample_tomato.jpg").use { stream ->
-                    BitmapFactory.decodeStream(stream)
+                    BitmapFactory.decodeStream(stream, null, decodeOpts)
                 }?.let { decoded ->
                     if (decoded.config != Bitmap.Config.ARGB_8888) {
-                        decoded.copy(Bitmap.Config.ARGB_8888, false).also { decoded.recycle() }
+                        decoded.copy(Bitmap.Config.ARGB_8888, false)?.also { decoded.recycle() }
+                            ?: run { decoded.recycle(); null }
                     } else {
                         decoded
                     }
                 }
+            } catch (_: OutOfMemoryError) {
+                null
             } catch (_: Exception) {
                 null
             }
@@ -1171,45 +1405,72 @@ class MainActivity : AppCompatActivity() {
                     }
                     Toast.makeText(this, "内置样本图加载失败", Toast.LENGTH_SHORT).show()
                 }
-                return@execute
+                return@safeExecute
             }
 
-            var initRes: InitResult? = null
-            if (!modelReady) {
-                initRes = initModelOnInferenceThread(config.useGpu)
-            }
-            if (!modelReady) {
+            if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
                 bmp.recycle()
-                val res = initRes
-                runOnUiThread {
-                    if (isDestroyed || isFinishing) return@runOnUiThread
-                    if (res != null) applyInitUiFeedback(res, showSuccessFallbackToast = true)
-                    if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
-                        tvSummaryPill.text = "模型未就绪：请点击左上状态查看详情"
+                return@safeExecute
+            }
+
+            val dispatched = safeExecute(inferenceExecutor) {
+                if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
+                    bmp.recycle()
+                    return@safeExecute
+                }
+
+                var initRes: InitResult? = null
+                var localInitSeq = 0L
+                if (!modelReady) {
+                    modelInitInProgress.set(true)
+                    localInitSeq = initSeq.incrementAndGet()
+                    try {
+                        initRes = initModelOnInferenceThread(config.useGpu)
+                    } finally {
+                        modelInitInProgress.set(false)
                     }
                 }
-                return@execute
-            }
+                if (!modelReady || targetSession != activeSessionId.get()) {
+                    bmp.recycle()
+                    val res = initRes
+                    runOnUiThread {
+                        if (isDestroyed || isFinishing) return@runOnUiThread
+                        if (res != null && localInitSeq == initSeq.get()) {
+                            applyInitUiFeedback(res, showSuccessFallbackToast = true)
+                        }
+                        if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
+                            tvSummaryPill.text = "模型未就绪：请点击左上状态查看详情"
+                        }
+                    }
+                    return@safeExecute
+                }
 
-            val token = imageTokenGenerator.incrementAndGet()
-            val result = detector.detectFrame(bmp, config)
-            if (result.success) {
-                cachedBitmapToken.set(token)
+                val token = imageTokenGenerator.incrementAndGet()
+                val result = detector.detectFrame(bmp, config)
+                if (result.success) {
+                    cachedBitmapToken.set(token)
+                }
+                val snap = FrameSnapshot(targetSession, token, bmp, result)
+                runOnUiThread {
+                    if (isDestroyed || isFinishing) {
+                        bmp.recycle()
+                        return@runOnUiThread
+                    }
+                    if (initRes != null && localInitSeq == initSeq.get()) {
+                        applyInitUiFeedback(initRes, showSuccessFallbackToast = true)
+                    }
+                    if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
+                        lockedSnapshot = snap
+                        frozenImageView.setImageBitmap(snap.bitmap)
+                        updateSaveButtonState()
+                        renderSnapshot(snap)
+                    } else {
+                        bmp.recycle()
+                    }
+                }
             }
-            val snap = FrameSnapshot(targetSession, token, bmp, result)
-            runOnUiThread {
-                if (isDestroyed || isFinishing) {
-                    bmp.recycle()
-                    return@runOnUiThread
-                }
-                if (initRes != null) applyInitUiFeedback(initRes, showSuccessFallbackToast = true)
-                if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
-                    lockedSnapshot = snap
-                    frozenImageView.setImageBitmap(snap.bitmap)
-                    renderSnapshot(snap)
-                } else {
-                    bmp.recycle()
-                }
+            if (!dispatched) {
+                bmp.recycle()
             }
         }
     }
@@ -1217,7 +1478,10 @@ class MainActivity : AppCompatActivity() {
     private fun loadAlbumImage(uri: Uri) {
         val targetSession = prepareAlbumSession("正在分析相册图片…")
 
-        inferenceExecutor.execute {
+        safeExecute(ioExecutor) {
+            if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
+                return@safeExecute
+            }
             val upright = decodeUriWithExif(uri)
             if (upright == null) {
                 runOnUiThread {
@@ -1227,53 +1491,105 @@ class MainActivity : AppCompatActivity() {
                     }
                     Toast.makeText(this, "无法读取所选图片", Toast.LENGTH_SHORT).show()
                 }
-                return@execute
+                return@safeExecute
             }
 
-            var initRes: InitResult? = null
-            if (!modelReady) {
-                initRes = initModelOnInferenceThread(config.useGpu)
-            }
-            if (!modelReady) {
+            if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
                 upright.recycle()
-                val res = initRes
-                runOnUiThread {
-                    if (isDestroyed || isFinishing) return@runOnUiThread
-                    if (res != null) applyInitUiFeedback(res, showSuccessFallbackToast = true)
-                    if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
-                        tvSummaryPill.text = "模型未就绪：请点击左上状态查看详情"
+                return@safeExecute
+            }
+
+            val dispatched = safeExecute(inferenceExecutor) {
+                if (targetSession != activeSessionId.get() || isDestroyed || isFinishing) {
+                    upright.recycle()
+                    return@safeExecute
+                }
+
+                var initRes: InitResult? = null
+                var localInitSeq = 0L
+                if (!modelReady) {
+                    modelInitInProgress.set(true)
+                    localInitSeq = initSeq.incrementAndGet()
+                    try {
+                        initRes = initModelOnInferenceThread(config.useGpu)
+                    } finally {
+                        modelInitInProgress.set(false)
                     }
                 }
-                return@execute
-            }
+                if (!modelReady || targetSession != activeSessionId.get()) {
+                    upright.recycle()
+                    val res = initRes
+                    runOnUiThread {
+                        if (isDestroyed || isFinishing) return@runOnUiThread
+                        if (res != null && localInitSeq == initSeq.get()) {
+                            applyInitUiFeedback(res, showSuccessFallbackToast = true)
+                        }
+                        if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
+                            tvSummaryPill.text = "模型未就绪：请点击左上状态查看详情"
+                        }
+                    }
+                    return@safeExecute
+                }
 
-            val token = imageTokenGenerator.incrementAndGet()
-            val result = detector.detectFrame(upright, config)
-            if (result.success) {
-                cachedBitmapToken.set(token)
+                val token = imageTokenGenerator.incrementAndGet()
+                val result = detector.detectFrame(upright, config)
+                if (result.success) {
+                    cachedBitmapToken.set(token)
+                }
+                val snap = FrameSnapshot(targetSession, token, upright, result)
+                runOnUiThread {
+                    if (isDestroyed || isFinishing) {
+                        upright.recycle()
+                        return@runOnUiThread
+                    }
+                    if (initRes != null && localInitSeq == initSeq.get()) {
+                        applyInitUiFeedback(initRes, showSuccessFallbackToast = true)
+                    }
+                    if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
+                        lockedSnapshot = snap
+                        frozenImageView.setImageBitmap(snap.bitmap)
+                        updateSaveButtonState()
+                        renderSnapshot(snap)
+                    } else {
+                        upright.recycle()
+                    }
+                }
             }
-            val snap = FrameSnapshot(targetSession, token, upright, result)
-            runOnUiThread {
-                if (isDestroyed || isFinishing) {
-                    upright.recycle()
-                    return@runOnUiThread
-                }
-                if (initRes != null) applyInitUiFeedback(initRes, showSuccessFallbackToast = true)
-                if (targetSession == activeSessionId.get() && mode == AppMode.ALBUM) {
-                    lockedSnapshot = snap
-                    frozenImageView.setImageBitmap(snap.bitmap)
-                    renderSnapshot(snap)
-                } else {
-                    upright.recycle()
-                }
+            if (!dispatched) {
+                upright.recycle()
             }
         }
     }
 
     private fun decodeUriWithExif(uri: Uri): Bitmap? {
+        val resolver = applicationContext.contentResolver
         return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val source = ImageDecoder.createSource(resolver, uri)
+                val decoded = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val origW = info.size.width
+                    val origH = info.size.height
+                    if (origW > MAX_DECODE_DIM || origH > MAX_DECODE_DIM) {
+                        val scale = min(
+                            MAX_DECODE_DIM.toFloat() / origW.toFloat(),
+                            MAX_DECODE_DIM.toFloat() / origH.toFloat()
+                        )
+                        val targetW = (origW * scale).roundToInt().coerceAtLeast(1)
+                        val targetH = (origH * scale).roundToInt().coerceAtLeast(1)
+                        decoder.setTargetSize(targetW, targetH)
+                    }
+                }
+                return if (decoded.config != Bitmap.Config.ARGB_8888) {
+                    decoded.copy(Bitmap.Config.ARGB_8888, false)?.also { decoded.recycle() }
+                        ?: run { decoded.recycle(); null }
+                } else {
+                    decoded
+                }
+            }
+
             val orientation = try {
-                contentResolver.openInputStream(uri)?.use { stream ->
+                resolver.openInputStream(uri)?.use { stream ->
                     ExifInterface(stream).getAttributeInt(
                         ExifInterface.TAG_ORIENTATION,
                         ExifInterface.ORIENTATION_NORMAL
@@ -1286,7 +1602,7 @@ class MainActivity : AppCompatActivity() {
             val boundsOpts = BitmapFactory.Options().apply {
                 inJustDecodeBounds = true
             }
-            contentResolver.openInputStream(uri)?.use { stream ->
+            resolver.openInputStream(uri)?.use { stream ->
                 BitmapFactory.decodeStream(stream, null, boundsOpts)
             }
             if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) {
@@ -1304,12 +1620,13 @@ class MainActivity : AppCompatActivity() {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
                 inSampleSize = sampleSize
             }
-            val decoded = contentResolver.openInputStream(uri)?.use { stream ->
+            val decoded = resolver.openInputStream(uri)?.use { stream ->
                 BitmapFactory.decodeStream(stream, null, decodeOpts)
             } ?: return null
 
             val argb = if (decoded.config != Bitmap.Config.ARGB_8888) {
-                decoded.copy(Bitmap.Config.ARGB_8888, false).also { decoded.recycle() }
+                decoded.copy(Bitmap.Config.ARGB_8888, false)?.also { decoded.recycle() }
+                    ?: run { decoded.recycle(); return null }
             } else {
                 decoded
             }
@@ -1344,24 +1661,24 @@ class MainActivity : AppCompatActivity() {
     private fun reDetectLockedSnapshot(forceFullInfer: Boolean) {
         val snap = lockedSnapshot ?: return
         val targetSession = activeSessionId.get()
-        val cfgCopy = config
         val seq = reDetectSeq.incrementAndGet()
 
-        inferenceExecutor.execute {
-            if (!modelReady || targetSession != activeSessionId.get()) return@execute
-            if (!forceFullInfer && seq != reDetectSeq.get()) return@execute
+        safeExecute(inferenceExecutor) {
+            if (!modelReady || targetSession != activeSessionId.get()) return@safeExecute
+            if (seq != reDetectSeq.get()) return@safeExecute
 
+            val cfgLatest = config
             val newResult = if (!forceFullInfer && cachedBitmapToken.get() == snap.imageToken) {
-                val cachedRes = detector.repostprocessCached(cfgCopy)
+                val cachedRes = detector.repostprocessCached(cfgLatest)
                 if (!cachedRes.success && cachedRes.errorCode == YoloDetector.ERR_NO_CACHE) {
-                    detector.detectFrame(snap.bitmap, cfgCopy).also {
+                    detector.detectFrame(snap.bitmap, cfgLatest).also {
                         if (it.success) cachedBitmapToken.set(snap.imageToken)
                     }
                 } else {
                     cachedRes
                 }
             } else {
-                detector.detectFrame(snap.bitmap, cfgCopy).also {
+                detector.detectFrame(snap.bitmap, cfgLatest).also {
                     if (it.success) cachedBitmapToken.set(snap.imageToken)
                 }
             }
@@ -1369,8 +1686,13 @@ class MainActivity : AppCompatActivity() {
             val updated = FrameSnapshot(targetSession, snap.imageToken, snap.bitmap, newResult)
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
-                if (targetSession == activeSessionId.get() && mode != AppMode.LIVE) {
+                if (seq == reDetectSeq.get() &&
+                    targetSession == activeSessionId.get() &&
+                    mode != AppMode.LIVE &&
+                    lockedSnapshot?.imageToken == snap.imageToken
+                ) {
                     lockedSnapshot = updated
+                    updateSaveButtonState()
                     renderSnapshot(updated)
                 }
             }
@@ -1382,7 +1704,9 @@ class MainActivity : AppCompatActivity() {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
             return
         }
+        cancelPendingReDetect()
         lockedSnapshot = null
+        isHdRefining = false
         frozenImageView.setImageDrawable(null)
         clearSelectedTruss()
         lastFrameError = ""
@@ -1398,15 +1722,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateSaveButtonState() {
+        val enabled = !isHdRefining && !isExporting && lockedSnapshot?.result?.success == true
+        btnSaveResult.isEnabled = enabled
+        btnSaveResult.alpha = if (enabled) 1.0f else 0.5f
+        btnSaveResult.text = when {
+            isExporting -> "保存中…"
+            isHdRefining -> "精检中…"
+            else -> getString(R.string.save_annotated)
+        }
+    }
+
     private fun updateModeUi() {
         when (mode) {
             AppMode.LIVE -> {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 previewView.visibility = View.VISIBLE
                 frozenImageView.visibility = View.GONE
                 liveControlRow.visibility = View.VISIBLE
                 frozenControlRow.visibility = View.GONE
             }
             AppMode.FROZEN -> {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 previewView.visibility = View.INVISIBLE
                 frozenImageView.visibility = View.VISIBLE
                 lockedSnapshot?.let { frozenImageView.setImageBitmap(it.bitmap) }
@@ -1415,6 +1752,7 @@ class MainActivity : AppCompatActivity() {
                 btnResumeLive.setText(R.string.resume_live)
             }
             AppMode.ALBUM -> {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 previewView.visibility = View.INVISIBLE
                 frozenImageView.visibility = View.VISIBLE
                 lockedSnapshot?.let { frozenImageView.setImageBitmap(it.bitmap) }
@@ -1423,6 +1761,7 @@ class MainActivity : AppCompatActivity() {
                 btnResumeLive.setText(R.string.back_to_camera)
             }
         }
+        updateSaveButtonState()
         updateStatusCapsuleUi()
     }
 
@@ -1467,11 +1806,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setSelectedTruss(index: Int?, result: DetectionResult?) {
+    private fun setSelectedTruss(index: Int?, result: DetectionResult?, srcW: Int, srcH: Int) {
         if (index != null && result != null && index in result.trusses.indices) {
             val t = result.trusses[index]
             selectedTrussIndex = index
-            selectedTrussBox = RectF(t.x1, t.y1, t.x2, t.y2)
+            selectedTrussNormBox = TrussGeometry.toNormBox(t.x1, t.y1, t.x2, t.y2, srcW, srcH)
         } else {
             clearSelectedTruss()
         }
@@ -1479,11 +1818,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun clearSelectedTruss() {
         selectedTrussIndex = null
-        selectedTrussBox = null
+        selectedTrussNormBox = null
     }
 
-    private fun reconcileSelectedTruss(result: DetectionResult) {
-        val targetBox = selectedTrussBox ?: run {
+    private fun reconcileSelectedTruss(result: DetectionResult, srcW: Int, srcH: Int) {
+        val targetBox = selectedTrussNormBox ?: run {
             if (selectedTrussIndex != null && selectedTrussIndex !in result.trusses.indices) {
                 selectedTrussIndex = null
             }
@@ -1493,37 +1832,14 @@ class MainActivity : AppCompatActivity() {
             clearSelectedTruss()
             return
         }
-        var bestIdx = -1
-        var bestIou = 0f
-        for ((idx, t) in result.trusses.withIndex()) {
-            val iou = rectIou(targetBox, t.x1, t.y1, t.x2, t.y2)
-            if (iou > bestIou) {
-                bestIou = iou
-                bestIdx = idx
-            }
-        }
-        if (bestIdx >= 0 && bestIou >= 0.25f) {
-            val matched = result.trusses[bestIdx]
-            selectedTrussIndex = bestIdx
-            targetBox.set(matched.x1, matched.y1, matched.x2, matched.y2)
+        val matchedIdx = TrussGeometry.matchTrussIndex(targetBox, result.trusses, srcW, srcH, minIou = 0.25f)
+        if (matchedIdx != null) {
+            val matched = result.trusses[matchedIdx]
+            selectedTrussIndex = matchedIdx
+            selectedTrussNormBox = TrussGeometry.toNormBox(matched.x1, matched.y1, matched.x2, matched.y2, srcW, srcH)
         } else {
             clearSelectedTruss()
         }
-    }
-
-    private fun rectIou(a: RectF, bx1: Float, by1: Float, bx2: Float, by2: Float): Float {
-        val ix1 = max(a.left, bx1)
-        val iy1 = max(a.top, by1)
-        val ix2 = min(a.right, bx2)
-        val iy2 = min(a.bottom, by2)
-        val iw = max(0f, ix2 - ix1)
-        val ih = max(0f, iy2 - iy1)
-        val inter = iw * ih
-        if (inter <= 0f) return 0f
-        val areaA = max(0f, a.width()) * max(0f, a.height())
-        val areaB = max(0f, bx2 - bx1) * max(0f, by2 - by1)
-        val denom = areaA + areaB - inter
-        return if (denom > 0f) inter / denom else 0f
     }
 
     private fun redrawActiveOverlay() {
@@ -1539,7 +1855,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderLiveState(state: LiveFrameState) {
-        reconcileSelectedTruss(state.result)
+        reconcileSelectedTruss(state.result, state.srcWidth, state.srcHeight)
         arOverlayView.updateScene(
             result = state.result,
             sourceWidth = state.srcWidth,
@@ -1555,7 +1871,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderSnapshot(snapshot: FrameSnapshot) {
-        reconcileSelectedTruss(snapshot.result)
+        reconcileSelectedTruss(snapshot.result, snapshot.bitmap.width, snapshot.bitmap.height)
         arOverlayView.updateScene(
             result = snapshot.result,
             sourceWidth = snapshot.bitmap.width,
@@ -1624,7 +1940,7 @@ class MainActivity : AppCompatActivity() {
             tvSummaryPill.text = if (modelReady) "正在识别…" else "正在初始化模型…"
             selectedTrussCard.visibility = View.GONE
             if (summaryExpanded) {
-                populateSummaryDrawer(null)
+                populateSummaryDrawer(null, force = false)
             }
             return
         }
@@ -1632,7 +1948,7 @@ class MainActivity : AppCompatActivity() {
             tvSummaryPill.text = "推理异常：点击左上状态查看详情"
             selectedTrussCard.visibility = View.GONE
             if (summaryExpanded) {
-                populateSummaryDrawer(null)
+                populateSummaryDrawer(null, force = false)
             }
             return
         }
@@ -1656,14 +1972,50 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (summaryExpanded) {
-            populateSummaryDrawer(res)
+            populateSummaryDrawer(res, force = false)
         }
     }
 
-    private fun populateSummaryDrawer(res: DetectionResult?) {
-        trussListContainer.removeAllViews()
+    private fun createPooledDrawerRow(): TextView {
+        val dp = resources.displayMetrics.density
+        return TextView(this).apply {
+            textSize = 12.5f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, (6f * dp).roundToInt(), 0, (6f * dp).roundToInt())
+            minHeight = (48f * dp).roundToInt()
+            if (selectableRowBgResId != 0) {
+                setBackgroundResource(selectableRowBgResId)
+            }
+            setOnClickListener { v ->
+                val clickedIdx = v.tag as? Int ?: return@setOnClickListener
+                val curRes = activeResult() ?: return@setOnClickListener
+                val curSize = activeSourceSize() ?: return@setOnClickListener
+                if (clickedIdx in curRes.trusses.indices) {
+                    setSelectedTruss(clickedIdx, curRes, curSize.first, curSize.second)
+                    summaryExpanded = false
+                    updateSummaryExpandedUi()
+                    renderCurrentSnapshotDetails()
+                    redrawActiveOverlay()
+                }
+            }
+        }
+    }
+
+    private fun populateSummaryDrawer(res: DetectionResult?, force: Boolean = true) {
+        if (!force && mode == AppMode.LIVE) {
+            val nowMs = SystemClock.uptimeMillis()
+            if (isSummaryScrolling || nowMs - lastLiveDrawerUpdateMs < 300L) {
+                return
+            }
+            lastLiveDrawerUpdateMs = nowMs
+        }
+
         if (res == null || !res.success) {
             tvExpandedOverall.text = "暂无检测结果"
+            for (i in 0 until trussListContainer.childCount) {
+                trussListContainer.getChildAt(i).visibility = View.GONE
+            }
+            updateSummaryScrollHeight()
             return
         }
 
@@ -1671,47 +2023,76 @@ class MainActivity : AppCompatActivity() {
             "检出 ${res.fruits.size} 颗 ｜ 已归属 ${res.assignedTotal} 颗 [成熟 ${res.assignedRipe} · 转色 ${res.assignedTurning} · 未熟 ${res.assignedImmature}] ｜ 未归属 ${res.unassignedCount} 颗 ｜ 果穗整体成熟度 ${res.overallAssignedPercentText}"
 
         if (res.trusses.isEmpty()) {
-            val emptyTv = TextView(this).apply {
-                text = "当前画面未识别到完整果穗"
-                setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-                textSize = 12.5f
+            val row = if (trussListContainer.childCount > 0) {
+                trussListContainer.getChildAt(0) as TextView
+            } else {
+                createPooledDrawerRow().also { trussListContainer.addView(it) }
             }
-            trussListContainer.addView(emptyTv)
+            row.visibility = View.VISIBLE
+            row.tag = null
+            row.isClickable = false
+            row.text = "当前画面未识别到完整果穗"
+            row.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
+            for (i in 1 until trussListContainer.childCount) {
+                trussListContainer.getChildAt(i).visibility = View.GONE
+            }
         } else {
-            val dp = resources.displayMetrics.density
-            for ((idx, t) in res.trusses.withIndex()) {
-                val row = TextView(this).apply {
-                    text = "果穗 #${t.id}：${t.gradeLetter}级 (${t.maturityPercentText})  [熟 ${t.ripeCount} / 转 ${t.turningCount} / 青 ${t.immatureCount}]  →  ${t.shortAdvice}"
-                    setTextColor(
-                        if (selectedTrussIndex == idx) Color.parseColor("#FFD60A")
-                        else ContextCompat.getColor(context, R.color.text_primary)
-                    )
-                    textSize = 12.5f
-                    setPadding(0, (6f * dp).roundToInt(), 0, (6f * dp).roundToInt())
-                    minHeight = (40f * dp).roundToInt()
-                    setOnClickListener {
-                        setSelectedTruss(idx, res)
-                        summaryExpanded = false
-                        updateSummaryExpandedUi()
-                        renderCurrentSnapshotDetails()
-                        redrawActiveOverlay()
-                    }
-                }
-                trussListContainer.addView(row)
+            val normalColor = ContextCompat.getColor(this, R.color.text_primary)
+            val selectedColor = Color.parseColor("#FFD60A")
+            val count = res.trusses.size
+            while (trussListContainer.childCount < count) {
+                trussListContainer.addView(createPooledDrawerRow())
+            }
+            for (idx in 0 until count) {
+                val t = res.trusses[idx]
+                val row = trussListContainer.getChildAt(idx) as TextView
+                row.visibility = View.VISIBLE
+                row.isClickable = true
+                row.tag = idx
+                row.text =
+                    "果穗 #${t.id}：${t.gradeLetter}级 (${t.maturityPercentText})  [熟 ${t.ripeCount} / 转 ${t.turningCount} / 青 ${t.immatureCount}]  →  ${t.shortAdvice}"
+                row.setTextColor(if (selectedTrussIndex == idx) selectedColor else normalColor)
+            }
+            for (i in count until trussListContainer.childCount) {
+                trussListContainer.getChildAt(i).visibility = View.GONE
             }
         }
 
-        summaryScrollView.post {
-            if (isDestroyed || isFinishing || summaryScrollMaxHeightPx <= 0) return@post
-            val lp = summaryScrollView.layoutParams
-            val targetH = if (trussListContainer.height > summaryScrollMaxHeightPx) {
-                summaryScrollMaxHeightPx
-            } else {
-                ViewGroup.LayoutParams.WRAP_CONTENT
+        updateSummaryScrollHeight()
+    }
+
+    private fun updateSummaryScrollHeight() {
+        if (summaryScrollMaxHeightPx <= 0) return
+        val applyHeight = { contentHeight: Int ->
+            if (!isDestroyed && !isFinishing && summaryScrollMaxHeightPx > 0) {
+                val lp = summaryScrollView.layoutParams
+                val targetH = if (contentHeight > summaryScrollMaxHeightPx) {
+                    summaryScrollMaxHeightPx
+                } else {
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                }
+                if (lp.height != targetH) {
+                    lp.height = targetH
+                    summaryScrollView.layoutParams = lp
+                }
             }
-            if (lp.height != targetH) {
-                lp.height = targetH
-                summaryScrollView.layoutParams = lp
+        }
+
+        if (summaryScrollView.width > 0) {
+            val wSpec = View.MeasureSpec.makeMeasureSpec(summaryScrollView.width, View.MeasureSpec.EXACTLY)
+            val hSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            trussListContainer.measure(wSpec, hSpec)
+            applyHeight(trussListContainer.measuredHeight)
+        } else {
+            summaryScrollView.post {
+                if (summaryScrollView.width > 0) {
+                    val wSpec = View.MeasureSpec.makeMeasureSpec(summaryScrollView.width, View.MeasureSpec.EXACTLY)
+                    val hSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                    trussListContainer.measure(wSpec, hSpec)
+                    applyHeight(trussListContainer.measuredHeight)
+                } else {
+                    applyHeight(trussListContainer.height)
+                }
             }
         }
     }
@@ -1732,16 +2113,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         val cfgCopy = config
-        val selCopy = selectedTrussIndex
-        btnSaveResult.isEnabled = false
+        isExporting = true
+        updateSaveButtonState()
 
-        ioExecutor.execute {
-            val outBmp = ArOverlayView.renderExportBitmap(snap.bitmap, snap.result, cfgCopy, selCopy)
-            val savedPath = saveBitmapToGallery(outBmp)
-            outBmp.recycle()
+        val submitted = safeExecute(ioExecutor) {
+            var outBmp: Bitmap? = null
+            val savedPath = try {
+                outBmp = ArOverlayView.renderExportBitmap(snap.bitmap, snap.result, cfgCopy)
+                if (outBmp != null) saveBitmapToGallery(outBmp) else null
+            } catch (_: Throwable) {
+                null
+            } finally {
+                outBmp?.recycle()
+            }
+
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
-                btnSaveResult.isEnabled = true
+                isExporting = false
+                updateSaveButtonState()
                 if (savedPath != null) {
                     Toast.makeText(this, "已保存标注图：$savedPath", Toast.LENGTH_LONG).show()
                 } else {
@@ -1749,10 +2138,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        if (!submitted) {
+            isExporting = false
+            updateSaveButtonState()
+        }
     }
 
     private fun saveBitmapToGallery(bitmap: Bitmap): String? {
-        val name = "TomatoAR_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+        val name = "TomatoAR_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
+        val appCtx = applicationContext
+        val resolver = appCtx.contentResolver
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
@@ -1761,22 +2156,22 @@ class MainActivity : AppCompatActivity() {
                     put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/TomatoAR")
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
-                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
                 try {
-                    val compressed = contentResolver.openOutputStream(uri)?.use { out ->
+                    val compressed = resolver.openOutputStream(uri)?.use { out ->
                         bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
                     } ?: false
                     if (!compressed) {
-                        contentResolver.delete(uri, null, null)
+                        resolver.delete(uri, null, null)
                         return null
                     }
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    contentResolver.update(uri, values, null, null)
+                    resolver.update(uri, values, null, null)
                     "Pictures/TomatoAR/$name"
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     try {
-                        contentResolver.delete(uri, null, null)
+                        resolver.delete(uri, null, null)
                     } catch (_: Exception) {
                     }
                     null
@@ -1784,17 +2179,24 @@ class MainActivity : AppCompatActivity() {
             } else {
                 @Suppress("DEPRECATION")
                 val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "TomatoAR")
-                if (!dir.exists()) dir.mkdirs()
-                val file = File(dir, name)
-                val compressed = FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-                if (!compressed) {
-                    file.delete()
+                if (!dir.exists() && !dir.mkdirs()) {
                     return null
                 }
-                MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
-                file.absolutePath
+                val file = File(dir, name)
+                try {
+                    val compressed = FileOutputStream(file).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                    }
+                    if (!compressed) {
+                        file.delete()
+                        return null
+                    }
+                    MediaScannerConnection.scanFile(appCtx, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
+                    file.absolutePath
+                } catch (_: Exception) {
+                    file.delete()
+                    null
+                }
             }
         } catch (_: Exception) {
             null

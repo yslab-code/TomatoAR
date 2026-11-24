@@ -6,104 +6,112 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Continuous rounded AR Viewfinder corner brackets inside safe zone (29..79) -->
+    <!-- Continuous rounded AR Viewfinder corner brackets inside safe zone (32..76) -->
     <path
-        android:pathData="M29,39 L29,32 Q29,29 32,29 L39,29
-                          M69,29 L76,29 Q79,29 79,32 L79,39
-                          M29,69 L29,76 Q29,79 32,79 L39,79
-                          M69,79 L76,79 Q79,79 79,76 L79,69"
-        android:strokeWidth="3.0"
+        android:pathData="M32,41 L32,35 Q32,32 35,32 L41,32
+                          M67,32 L73,32 Q76,32 76,35 L76,41
+                          M32,67 L32,73 Q32,76 35,76 L41,76
+                          M67,76 L73,76 Q76,76 76,73 L76,67"
+        android:strokeWidth="2.8"
         android:strokeColor="#F2FFFFFF"
         android:strokeLineCap="round"
         android:strokeLineJoin="round" />
 
-    <!-- Main truss vine stem + side pedicels -->
-    <path
-        android:pathData="M54,31 C53,40 55.5,47 54,55 C52.5,63 53.5,69 54,75
-                          M54,38 C49.5,38 46,39.5 43.5,42
-                          M54.5,47.5 C59,47.5 62,49 64,51.5
-                          M53.5,58 C49,58 46.5,59.5 45,62"
-        android:strokeWidth="2.5"
-        android:strokeColor="#FF34C759"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round" />
+    <!-- Vine stem, fruit truss, highlights, calyxes and status dot scaled to stay inside 32..76 brackets -->
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.86"
+        android:scaleY="0.86">
 
-    <!-- Soft drop shadow behind fruits -->
-    <path
-        android:fillColor="#40000000"
-        android:pathData="M44.2,39.5 A9.5,9.5 0 1,1 44.19,39.5 Z" />
-    <path
-        android:fillColor="#40000000"
-        android:pathData="M64.7,48.8 A9.2,9.2 0 1,1 64.69,48.8 Z" />
-    <path
-        android:fillColor="#40000000"
-        android:pathData="M45.7,59.2 A8.8,8.8 0 1,1 45.69,59.2 Z" />
+        <!-- Main truss vine stem + side pedicels -->
+        <path
+            android:pathData="M54,31 C53,40 55.5,47 54,55 C52.5,63 53.5,69 54,75
+                              M54,38 C49.5,38 46,39.5 43.5,42
+                              M54.5,47.5 C59,47.5 62,49 64,51.5
+                              M53.5,58 C49,58 46.5,59.5 45,62"
+            android:strokeWidth="2.5"
+            android:strokeColor="#FF34C759"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
 
-    <!-- 1. Ripe Cherry Tomato (Top-Left, #FF3B30) -->
-    <path android:pathData="M43.5,38.5 A9.5,9.5 0 1,1 43.49,38.5 Z">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:centerX="40.3"
-                android:centerY="44.5"
-                android:gradientRadius="12.5"
-                android:type="radial">
-                <item android:color="#FFFF6E61" android:offset="0.0" />
-                <item android:color="#FFFF3B30" android:offset="0.55" />
-                <item android:color="#FFB81D14" android:offset="1.0" />
-            </gradient>
-        </aapt:attr>
-    </path>
-    <path
-        android:fillColor="#99FFFFFF"
-        android:pathData="M38.5,43.0 A3.1,2.0 -30 1,1 38.49,43.0 Z" />
-    <path
-        android:fillColor="#FF28A745"
-        android:pathData="M43.5,39.5 L39.8,36.8 L42.7,38.1 L43.5,34.9 L44.3,38.1 L47.2,36.8 Z" />
+        <!-- Soft drop shadow behind fruits -->
+        <path
+            android:fillColor="#40000000"
+            android:pathData="M44.2,39.5 A9.5,9.5 0 1,1 44.19,39.5 Z" />
+        <path
+            android:fillColor="#40000000"
+            android:pathData="M64.7,48.8 A9.2,9.2 0 1,1 64.69,48.8 Z" />
+        <path
+            android:fillColor="#40000000"
+            android:pathData="M45.7,59.2 A8.8,8.8 0 1,1 45.69,59.2 Z" />
 
-    <!-- 2. Turning Cherry Tomato (Middle-Right, #FF9500) -->
-    <path android:pathData="M64,47.8 A9.2,9.2 0 1,1 63.99,47.8 Z">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:centerX="60.9"
-                android:centerY="53.5"
-                android:gradientRadius="12.2"
-                android:type="radial">
-                <item android:color="#FFFFC452" android:offset="0.0" />
-                <item android:color="#FFFF9500" android:offset="0.55" />
-                <item android:color="#FFC26400" android:offset="1.0" />
-            </gradient>
-        </aapt:attr>
-    </path>
-    <path
-        android:fillColor="#99FFFFFF"
-        android:pathData="M59.2,52.2 A2.9,1.8 -30 1,1 59.19,52.2 Z" />
-    <path
-        android:fillColor="#FF28A745"
-        android:pathData="M64,48.8 L60.5,46.2 L63.2,47.4 L64,44.4 L64.8,47.4 L67.5,46.2 Z" />
+        <!-- 1. Ripe Cherry Tomato (Top-Left, #FF3B30) -->
+        <path android:pathData="M43.5,38.5 A9.5,9.5 0 1,1 43.49,38.5 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:centerX="40.3"
+                    android:centerY="44.5"
+                    android:gradientRadius="12.5"
+                    android:type="radial">
+                    <item android:color="#FFFF6E61" android:offset="0.0" />
+                    <item android:color="#FFFF3B30" android:offset="0.55" />
+                    <item android:color="#FFB81D14" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:fillColor="#99FFFFFF"
+            android:pathData="M38.5,43.0 A3.1,2.0 -30 1,1 38.49,43.0 Z" />
+        <path
+            android:fillColor="#FF28A745"
+            android:pathData="M43.5,39.5 L39.8,36.8 L42.7,38.1 L43.5,34.9 L44.3,38.1 L47.2,36.8 Z" />
 
-    <!-- 3. Immature Cherry Tomato (Bottom-Left, #34C759) -->
-    <path android:pathData="M45,58.2 A8.8,8.8 0 1,1 44.99,58.2 Z">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:centerX="42.1"
-                android:centerY="63.6"
-                android:gradientRadius="11.6"
-                android:type="radial">
-                <item android:color="#FF7CEB98" android:offset="0.0" />
-                <item android:color="#FF34C759" android:offset="0.55" />
-                <item android:color="#FF1C8738" android:offset="1.0" />
-            </gradient>
-        </aapt:attr>
-    </path>
-    <path
-        android:fillColor="#88FFFFFF"
-        android:pathData="M40.4,62.4 A2.7,1.7 -30 1,1 40.39,62.4 Z" />
-    <path
-        android:fillColor="#FF1F8F3D"
-        android:pathData="M45,59.1 L41.8,56.6 L44.3,57.8 L45,54.9 L45.7,57.8 L48.2,56.6 Z" />
+        <!-- 2. Turning Cherry Tomato (Middle-Right, #FF9500) -->
+        <path android:pathData="M64,47.8 A9.2,9.2 0 1,1 63.99,47.8 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:centerX="60.9"
+                    android:centerY="53.5"
+                    android:gradientRadius="12.2"
+                    android:type="radial">
+                    <item android:color="#FFFFC452" android:offset="0.0" />
+                    <item android:color="#FFFF9500" android:offset="0.55" />
+                    <item android:color="#FFC26400" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:fillColor="#99FFFFFF"
+            android:pathData="M59.2,52.2 A2.9,1.8 -30 1,1 59.19,52.2 Z" />
+        <path
+            android:fillColor="#FF28A745"
+            android:pathData="M64,48.8 L60.5,46.2 L63.2,47.4 L64,44.4 L64.8,47.4 L67.5,46.2 Z" />
 
-    <!-- Small AR live indicator dot -->
-    <path
-        android:fillColor="#FF34C759"
-        android:pathData="M73.5,34.5 A2.0,2.0 0 1,1 73.49,34.5 Z" />
+        <!-- 3. Immature Cherry Tomato (Bottom-Left, #34C759) -->
+        <path android:pathData="M45,58.2 A8.8,8.8 0 1,1 44.99,58.2 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:centerX="42.1"
+                    android:centerY="63.6"
+                    android:gradientRadius="11.6"
+                    android:type="radial">
+                    <item android:color="#FF7CEB98" android:offset="0.0" />
+                    <item android:color="#FF34C759" android:offset="0.55" />
+                    <item android:color="#FF1C8738" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:fillColor="#88FFFFFF"
+            android:pathData="M40.4,62.4 A2.7,1.7 -30 1,1 40.39,62.4 Z" />
+        <path
+            android:fillColor="#FF1F8F3D"
+            android:pathData="M45,59.1 L41.8,56.6 L44.3,57.8 L45,54.9 L45.7,57.8 L48.2,56.6 Z" />
+
+        <!-- Small AR live indicator dot -->
+        <path
+            android:fillColor="#FF34C759"
+            android:pathData="M73.5,34.5 A2.0,2.0 0 1,1 73.49,34.5 Z" />
+    </group>
 </vector>

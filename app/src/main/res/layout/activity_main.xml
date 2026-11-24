@@ -38,24 +38,31 @@
         android:paddingTop="10dp"
         android:paddingEnd="14dp">
 
-        <RelativeLayout
+        <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="wrap_content">
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-            <LinearLayout
-                android:id="@+id/btnStatusCapsule"
-                android:layout_width="wrap_content"
+            <FrameLayout
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_alignParentStart="true"
-                android:layout_centerVertical="true"
-                android:background="@drawable/bg_hud_capsule"
-                android:clickable="true"
-                android:focusable="true"
-                android:gravity="center_vertical"
-                android:minHeight="48dp"
-                android:orientation="horizontal"
-                android:paddingStart="14dp"
-                android:paddingEnd="14dp">
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1">
+
+                <LinearLayout
+                    android:id="@+id/btnStatusCapsule"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="start|center_vertical"
+                    android:background="@drawable/bg_hud_capsule"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center_vertical"
+                    android:minHeight="48dp"
+                    android:orientation="horizontal"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp">
 
                 <View
                     android:id="@+id/statusDot"
@@ -86,18 +93,18 @@
                     android:visibility="gone" />
             </LinearLayout>
 
+            </FrameLayout>
+
             <ImageButton
                 android:id="@+id/btnSettings"
                 android:layout_width="48dp"
                 android:layout_height="48dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
                 android:background="@drawable/bg_hud_capsule"
                 android:contentDescription="@string/cd_settings"
                 android:padding="12dp"
                 android:scaleType="centerInside"
                 android:src="@drawable/ic_tune" />
-        </RelativeLayout>
+        </LinearLayout>
 
         <!-- Collapsible Tech Detail Card -->
         <LinearLayout
@@ -282,6 +289,9 @@
                 android:id="@+id/tvSummaryPill"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:maxWidth="280dp"
                 android:text="正在初始化模型…"
                 android:textColor="@color/text_primary"
                 android:textSize="13sp"
@@ -706,7 +716,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="10dp"
-                        android:text="相机采集分辨率"
+                        android:text="预览与定格分辨率（分析流自动降采样提速）"
                         android:textColor="@color/text_primary"
                         android:textSize="14sp" />
 
