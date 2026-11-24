@@ -1288,18 +1288,14 @@ class MainActivity : AppCompatActivity() {
                 rawBmp.copyPixelsFromBuffer(buffer)
             } else {
                 val neededBytes = tightRowBytes * h
-                var tightBuffer = fallbackTightBuffer
-                if (tightBuffer == null || tightBuffer.capacity() < neededBytes) {
-                    tightBuffer = ByteBuffer.allocateDirect(neededBytes)
-                    fallbackTightBuffer = tightBuffer
-                }
+                val tightBuffer: ByteBuffer = fallbackTightBuffer
+                    ?.takeIf { it.capacity() >= neededBytes }
+                    ?: ByteBuffer.allocateDirect(neededBytes).also { fallbackTightBuffer = it }
                 tightBuffer.clear()
 
-                var rowTmp = fallbackRowScratch
-                if (rowTmp == null || rowTmp.size < tightRowBytes) {
-                    rowTmp = ByteArray(tightRowBytes)
-                    fallbackRowScratch = rowTmp
-                }
+                val rowTmp: ByteArray = fallbackRowScratch
+                    ?.takeIf { it.size >= tightRowBytes }
+                    ?: ByteArray(tightRowBytes).also { fallbackRowScratch = it }
 
                 for (y in 0 until h) {
                     val rowOffset = y * rowStride
