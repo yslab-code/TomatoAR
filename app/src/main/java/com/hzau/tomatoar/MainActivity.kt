@@ -101,6 +101,7 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val activeSessionId = AtomicLong(1L)
+    private val cameraBindEpoch = AtomicLong(0L)
     private val imageTokenGenerator = AtomicLong(1L)
     private val cachedBitmapToken = AtomicLong(0L)
     private val freezeRequested = AtomicBoolean(false)
@@ -316,6 +317,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun unbindCameraSafely() {
+        cameraBindEpoch.incrementAndGet()
         try {
             currentImageAnalysis?.clearAnalyzer()
         } catch (_: Exception) {
@@ -856,20 +858,25 @@ class MainActivity : AppCompatActivity() {
         measuredFps = 0f
         if (mode == AppMode.LIVE) {
             latestLiveState = null
+            selectedTrussIndex = null
+            selectedTrussNormBox = null
+            arOverlayView.updateScene(null, 0, 0, config, null)
         }
     }
 
-    private fun initModelOnInferenceThread(useGpu: Boolean): InitResult {
+    private fun initModelOnInferenceThread(useGpu: Boolean, expectedSeq: Long? = null): InitResult {
         cachedBitmapToken.set(0L)
         val initRes = detector.initialize(assets, useGpu)
-        modelReady = initRes.success
-        activeBackendLabel = initRes.activeBackend
-        backendFallbackNotice = if (initRes.fallback) {
-            "GPU 回退：${initRes.reason}"
-        } else if (!initRes.success) {
-            initRes.reason
-        } else {
-            ""
+        if (expectedSeq == null || expectedSeq == initSeq.get()) {
+            modelReady = initRes.success
+            activeBackendLabel = initRes.activeBackend
+            backendFallbackNotice = if (initRes.fallback) {
+                "GPU 回退：${initRes.reason}"
+            } else if (!initRes.success) {
+                initRes.reason
+            } else {
+                ""
+            }
         }
         return initRes
     }
@@ -889,10 +896,15 @@ class MainActivity : AppCompatActivity() {
 
         val targetSession = activeSessionId.get()
         val submitted = safeExecute(inferenceExecutor) {
+            if (seq != initSeq.get()) {
+                return@safeExecute
+            }
             val initRes = try {
-                initModelOnInferenceThread(useGpu)
+                initModelOnInferenceThread(useGpu, expectedSeq = seq)
             } finally {
-                modelInitInProgress.set(false)
+                if (seq == initSeq.get()) {
+                    modelInitInProgress.set(false)
+                }
             }
             runOnUiThread {
                 if (isDestroyed || isFinishing || seq != initSeq.get()) return@runOnUiThread
@@ -902,7 +914,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        if (!submitted) {
+        if (!submitted && seq == initSeq.get()) {
             modelInitInProgress.set(false)
         }
     }
@@ -1111,16 +1123,17 @@ class MainActivity : AppCompatActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
-            val boundSession = activeSessionId.get()
+            val bindEpoch = cameraBindEpoch.incrementAndGet()
             val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
 
             imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
                 try {
                     if (mode != AppMode.LIVE || !modelReady || modelInitInProgress.get() ||
-                        boundSession != activeSessionId.get()
+                        bindEpoch != cameraBindEpoch.get()
                     ) {
                         return@setAnalyzer
                     }
+                    val frameSession = activeSessionId.get()
                     val cfgCopy = config
                     val shouldFreeze = freezeRequested.compareAndSet(true, false)
 
@@ -1134,7 +1147,7 @@ class MainActivity : AppCompatActivity() {
                             }
                             return@setAnalyzer
                         }
-                        if (boundSession != activeSessionId.get() || mode != AppMode.LIVE) {
+                        if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
                             upright.recycle()
                             return@setAnalyzer
                         }
@@ -1143,11 +1156,11 @@ class MainActivity : AppCompatActivity() {
                         if (result.success) {
                             cachedBitmapToken.set(token)
                         }
-                        if (boundSession != activeSessionId.get() || mode != AppMode.LIVE) {
+                        if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
                             upright.recycle()
                             return@setAnalyzer
                         }
-                        val snap = FrameSnapshot(boundSession, token, upright, result)
+                        val snap = FrameSnapshot(frameSession, token, upright, result)
                         runOnUiThread {
                             if (isDestroyed || isFinishing) {
                                 upright.recycle()
@@ -1212,12 +1225,12 @@ class MainActivity : AppCompatActivity() {
                         upright.recycle()
                     }
 
-                    if (boundSession != activeSessionId.get() || mode != AppMode.LIVE) {
+                    if (frameSession != activeSessionId.get() || bindEpoch != cameraBindEpoch.get() || mode != AppMode.LIVE) {
                         return@setAnalyzer
                     }
 
-                    updateFpsOnAnalyzerThread(boundSession)
-                    val state = LiveFrameState(boundSession, uprightW, uprightH, result)
+                    updateFpsOnAnalyzerThread(frameSession)
+                    val state = LiveFrameState(frameSession, uprightW, uprightH, result)
                     runOnUiThread {
                         if (!isDestroyed && !isFinishing && mode == AppMode.LIVE && state.sessionId == activeSessionId.get()) {
                             latestLiveState = state
