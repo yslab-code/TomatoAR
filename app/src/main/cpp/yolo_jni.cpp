@@ -118,14 +118,23 @@ int compute_grade_code(int ripe, int turning, int immature) {
     return 5;                         // E: 0.00 <= I <= 0.20
 }
 
-std::string format_cpu_backend_label(int cpu_threads, int big_cores) {
-    if (big_cores > 0) {
-        return "CPU " + std::to_string(cpu_threads) + "大核";
+std::string format_backend_label(bool use_gpu, bool enable_fp16, int cpu_threads, int big_cores) {
+    const std::string prec = enable_fp16 ? " (FP16)" : " (FP32)";
+    if (use_gpu) {
+        return "Vulkan GPU" + prec;
     }
-    return "CPU " + std::to_string(cpu_threads) + "线程";
+    if (big_cores >= 3) {
+        return "CPU " + std::to_string(cpu_threads) + "大核" + prec;
+    }
+    return "CPU " + std::to_string(cpu_threads) + "线程" + prec;
 }
 
-bool load_and_probe(AAssetManager* mgr, bool use_gpu, std::string& err_msg, std::string& backend_label) {
+bool load_and_probe(
+        AAssetManager* mgr,
+        bool use_gpu,
+        bool enable_fp16,
+        std::string& err_msg,
+        std::string& backend_label) {
     g_yolo_net.clear();
     g_blob_pool_allocator.clear();
     g_workspace_pool_allocator.clear();
@@ -150,10 +159,14 @@ bool load_and_probe(AAssetManager* mgr, bool use_gpu, std::string& err_msg, std:
     }
 
     const int big_cores = ncnn::get_big_cpu_count();
+    const int little_cores = ncnn::get_little_cpu_count();
     const int total_cores = ncnn::get_cpu_count();
-    const int cpu_threads = std::clamp(big_cores > 0 ? big_cores : total_cores, 1, 4);
+    const int non_little_cores = (little_cores > 0 && total_cores > little_cores)
+            ? (total_cores - little_cores)
+            : total_cores;
+    const int cpu_threads = std::clamp(non_little_cores >= 3 ? non_little_cores : total_cores, 1, 4);
     if (!use_gpu) {
-        ncnn::set_cpu_powersave(big_cores > 0 ? 2 : 0);
+        ncnn::set_cpu_powersave(big_cores >= 3 ? 2 : 0);
     }
 
     ncnn::Option opt;
@@ -162,13 +175,15 @@ bool load_and_probe(AAssetManager* mgr, bool use_gpu, std::string& err_msg, std:
     opt.lightmode = true;
     opt.blob_allocator = &g_blob_pool_allocator;
     opt.workspace_allocator = &g_workspace_pool_allocator;
-    // ScConv/SRU contains small eps (1e-10) and variance scaling (* 2048.0),
-    // which can underflow to 0/NaN or overflow in FP16/BF16 on ARM64/Vulkan.
-    opt.use_fp16_packed = false;
-    opt.use_fp16_storage = false;
-    opt.use_fp16_arithmetic = false;
+    opt.use_fp16_packed = enable_fp16;
+    opt.use_fp16_storage = enable_fp16;
+    opt.use_fp16_arithmetic = enable_fp16;
     opt.use_bf16_packed = false;
     opt.use_bf16_storage = false;
+    opt.use_packing_layout = true;
+    opt.use_winograd_convolution = true;
+    opt.use_sgemm_convolution = true;
+    opt.openmp_blocktime = 20;
     g_yolo_net.opt = opt;
 
     const int p_ret = g_yolo_net.load_param(mgr, "best.ncnn.param");
@@ -184,43 +199,46 @@ bool load_and_probe(AAssetManager* mgr, bool use_gpu, std::string& err_msg, std:
         return false;
     }
 
-    // Probe inference once to ensure Vulkan pipeline, output tensor shape, and finite math are valid
-    ncnn::Mat probe_in(kModelInputSize, kModelInputSize, 3);
-    probe_in.fill(0.0f);
-    ncnn::Extractor ex = g_yolo_net.create_extractor();
-    if (ex.input("in0", probe_in) != 0) {
-        err_msg = "试推理输入节点 in0 绑定失败";
-        g_yolo_net.clear();
-        return false;
-    }
-    ncnn::Mat probe_out;
-    const int ex_ret = ex.extract("out0", probe_out);
-    if (ex_ret != 0) {
-        err_msg = "试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
-        g_yolo_net.clear();
-        return false;
-    }
-    if (probe_out.dims != 2 || probe_out.h != kOutRows || probe_out.w != kNumAnchors) {
-        err_msg = "模型输出形状异常: dims=" + std::to_string(probe_out.dims) +
-                  " h=" + std::to_string(probe_out.h) + " w=" + std::to_string(probe_out.w) +
-                  " (期望 2D 8x5376)";
-        g_yolo_net.clear();
-        return false;
-    }
-    for (int r = 0; r < probe_out.h; ++r) {
-        const float* row_ptr = probe_out.row(r);
-        for (int c = 0; c < probe_out.w; ++c) {
-            if (!std::isfinite(row_ptr[c])) {
-                err_msg = "试推理输出含 NaN/Inf";
-                g_yolo_net.clear();
-                return false;
+    // Dual-probe inference (0.0 and 0.5) to validate Vulkan/FP16 pipeline, shape, and finite math
+    const float probe_vals[2] = {0.0f, 0.5f};
+    for (float pv : probe_vals) {
+        ncnn::Mat probe_in(kModelInputSize, kModelInputSize, 3);
+        probe_in.fill(pv);
+        ncnn::Extractor ex = g_yolo_net.create_extractor();
+        if (ex.input("in0", probe_in) != 0) {
+            err_msg = "试推理输入节点 in0 绑定失败";
+            g_yolo_net.clear();
+            return false;
+        }
+        ncnn::Mat probe_out;
+        const int ex_ret = ex.extract("out0", probe_out);
+        if (ex_ret != 0) {
+            err_msg = "试推理 extract(out0) 失败 (ret=" + std::to_string(ex_ret) + ")";
+            g_yolo_net.clear();
+            return false;
+        }
+        if (probe_out.dims != 2 || probe_out.h != kOutRows || probe_out.w != kNumAnchors) {
+            err_msg = "模型输出形状异常: dims=" + std::to_string(probe_out.dims) +
+                      " h=" + std::to_string(probe_out.h) + " w=" + std::to_string(probe_out.w) +
+                      " (期望 2D 8x5376)";
+            g_yolo_net.clear();
+            return false;
+        }
+        for (int r = 0; r < probe_out.h; ++r) {
+            const float* row_ptr = probe_out.row(r);
+            for (int c = 0; c < probe_out.w; ++c) {
+                if (!std::isfinite(row_ptr[c])) {
+                    err_msg = std::string(enable_fp16 ? "FP16" : "FP32") + " 试推理输出含 NaN/Inf";
+                    g_yolo_net.clear();
+                    return false;
+                }
             }
         }
     }
 
     g_model_loaded = true;
     g_gpu_active = use_gpu;
-    backend_label = use_gpu ? "Vulkan GPU" : format_cpu_backend_label(cpu_threads, big_cores);
+    backend_label = format_backend_label(use_gpu, enable_fp16, cpu_threads, big_cores);
     return true;
 }
 
@@ -250,36 +268,81 @@ ncnn::Mat rotate_and_mirror_chw(const ncnn::Mat& src, int rot_deg, bool mirror_h
         return ncnn::Mat();
     }
 
+    const int mode = ((rot_deg / 90) & 3) * 2 + (mirror_horizontal ? 1 : 0);
     for (int c = 0; c < 3; ++c) {
         const float* sptr = src.channel(c);
         float* dptr = dst.channel(c);
-        for (int sy = 0; sy < src_h; ++sy) {
-            const float* srow = sptr + sy * src_w;
-            for (int sx = 0; sx < src_w; ++sx) {
-                int rx = 0;
-                int ry = 0;
-                switch (rot_deg) {
-                    case 90:
-                        rx = src_h - 1 - sy;
-                        ry = sx;
-                        break;
-                    case 180:
-                        rx = src_w - 1 - sx;
-                        ry = src_h - 1 - sy;
-                        break;
-                    case 270:
-                        rx = sy;
-                        ry = src_w - 1 - sx;
-                        break;
-                    default: // 0
-                        rx = sx;
-                        ry = sy;
-                        break;
+        switch (mode) {
+            case 1: { // rot 0 + mirror
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    float* drow = dptr + sy * dst_w;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        drow[dst_w - 1 - sx] = srow[sx];
+                    }
                 }
-                const int dx = mirror_horizontal ? (dst_w - 1 - rx) : rx;
-                const int dy = ry;
-                dptr[dy * dst_w + dx] = srow[sx];
+                break;
             }
+            case 2: { // rot 90
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    const int dx = src_h - 1 - sy;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        dptr[sx * dst_w + dx] = srow[sx];
+                    }
+                }
+                break;
+            }
+            case 3: { // rot 90 + mirror
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    const int dx = sy;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        dptr[sx * dst_w + dx] = srow[sx];
+                    }
+                }
+                break;
+            }
+            case 4: { // rot 180
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    float* drow = dptr + (src_h - 1 - sy) * dst_w;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        drow[src_w - 1 - sx] = srow[sx];
+                    }
+                }
+                break;
+            }
+            case 5: { // rot 180 + mirror
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    float* drow = dptr + (src_h - 1 - sy) * dst_w;
+                    std::memcpy(drow, srow, static_cast<size_t>(src_w) * sizeof(float));
+                }
+                break;
+            }
+            case 6: { // rot 270
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    const int dx = sy;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        dptr[(src_w - 1 - sx) * dst_w + dx] = srow[sx];
+                    }
+                }
+                break;
+            }
+            case 7: { // rot 270 + mirror
+                for (int sy = 0; sy < src_h; ++sy) {
+                    const float* srow = sptr + sy * src_w;
+                    const int dx = src_h - 1 - sy;
+                    for (int sx = 0; sx < src_w; ++sx) {
+                        dptr[(src_w - 1 - sx) * dst_w + dx] = srow[sx];
+                    }
+                }
+                break;
+            }
+            default:
+                break;
         }
     }
     return dst;
@@ -580,25 +643,47 @@ Java_com_hzau_tomatoar_YoloDetector_initModel(
         return env->NewStringUTF("ERROR|未加载|AAssetManager 无效");
     }
 
-    std::string err;
     std::string backend;
-    if (load_and_probe(mgr, use_gpu == JNI_TRUE, err, backend)) {
+    if (use_gpu == JNI_TRUE) {
+        std::string gpu_fp16_err;
+        if (load_and_probe(mgr, true, true, gpu_fp16_err, backend)) {
+            const std::string resp = "OK|" + backend + "|";
+            return env->NewStringUTF(resp.c_str());
+        }
+        std::string gpu_fp32_err;
+        if (load_and_probe(mgr, true, false, gpu_fp32_err, backend)) {
+            const std::string resp = "OK|" + backend + "|";
+            return env->NewStringUTF(resp.c_str());
+        }
+
+        const std::string gpu_err = gpu_fp16_err + "; FP32(" + gpu_fp32_err + ")";
+        std::string cpu_fp16_err;
+        std::string cpu_backend;
+        if (load_and_probe(mgr, false, true, cpu_fp16_err, cpu_backend)) {
+            const std::string resp = "FALLBACK|" + cpu_backend + "|" + gpu_err;
+            return env->NewStringUTF(resp.c_str());
+        }
+        std::string cpu_fp32_err;
+        if (load_and_probe(mgr, false, false, cpu_fp32_err, cpu_backend)) {
+            const std::string resp = "FALLBACK|" + cpu_backend + "|" + gpu_err;
+            return env->NewStringUTF(resp.c_str());
+        }
+        const std::string resp = "ERROR|未加载|GPU(" + gpu_err + "); CPU(" + cpu_fp16_err + "; " + cpu_fp32_err + ")";
+        return env->NewStringUTF(resp.c_str());
+    }
+
+    std::string cpu_fp16_err;
+    if (load_and_probe(mgr, false, true, cpu_fp16_err, backend)) {
+        const std::string resp = "OK|" + backend + "|";
+        return env->NewStringUTF(resp.c_str());
+    }
+    std::string cpu_fp32_err;
+    if (load_and_probe(mgr, false, false, cpu_fp32_err, backend)) {
         const std::string resp = "OK|" + backend + "|";
         return env->NewStringUTF(resp.c_str());
     }
 
-    if (use_gpu == JNI_TRUE) {
-        std::string cpu_err;
-        std::string cpu_backend;
-        if (load_and_probe(mgr, false, cpu_err, cpu_backend)) {
-            const std::string resp = "FALLBACK|" + cpu_backend + "|" + err;
-            return env->NewStringUTF(resp.c_str());
-        }
-        const std::string resp = "ERROR|未加载|GPU(" + err + "); CPU(" + cpu_err + ")";
-        return env->NewStringUTF(resp.c_str());
-    }
-
-    const std::string resp = "ERROR|未加载|" + err;
+    const std::string resp = "ERROR|未加载|" + cpu_fp16_err + "; " + cpu_fp32_err;
     return env->NewStringUTF(resp.c_str());
 }
 

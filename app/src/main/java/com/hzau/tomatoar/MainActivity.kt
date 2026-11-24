@@ -438,11 +438,17 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "模型初始化中，请稍候…", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            if (latestLiveState == null) {
+            val liveState = latestLiveState
+            if (liveState == null) {
                 Toast.makeText(this, "等待首帧检测完成…", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            freezeRequested.set(true)
+            val rawPreviewBmp = previewView.bitmap
+            if (rawPreviewBmp != null) {
+                capturePreviewSnapshot(rawPreviewBmp, liveState)
+            } else {
+                freezeRequested.set(true)
+            }
         }
 
         btnFlipCamera.setOnClickListener {
@@ -741,6 +747,112 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun analysisTargetSize(): Size {
+        return if (config.captureResIndex == 0) {
+            Size(640, 480)
+        } else {
+            Size(640, 360)
+        }
+    }
+
+    private fun capturePreviewSnapshot(rawPreviewBmp: Bitmap, liveState: LiveFrameState) {
+        val cropped = cropBitmapToAspect(rawPreviewBmp, liveState.srcWidth, liveState.srcHeight)
+        val argbBmp = if (cropped.config != Bitmap.Config.ARGB_8888) {
+            cropped.copy(Bitmap.Config.ARGB_8888, false).also { cropped.recycle() }
+        } else {
+            cropped
+        }
+
+        val targetSession = activeSessionId.incrementAndGet()
+        freezeRequested.set(false)
+        val token = imageTokenGenerator.incrementAndGet()
+        val scaledResult = scaleResultCoordinates(
+            liveState.result,
+            liveState.srcWidth,
+            liveState.srcHeight,
+            argbBmp.width,
+            argbBmp.height
+        )
+        val initialSnap = FrameSnapshot(targetSession, token, argbBmp, scaledResult)
+        lockedSnapshot = initialSnap
+        mode = AppMode.FROZEN
+        cameraProvider?.unbindAll()
+        updateModeUi()
+        renderSnapshot(initialSnap)
+        btnSaveResult.isEnabled = false
+
+        val cfgCopy = config
+        inferenceExecutor.execute {
+            if (!modelReady || targetSession != activeSessionId.get()) {
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing) btnSaveResult.isEnabled = true
+                }
+                return@execute
+            }
+            val hdResult = detector.detectFrame(argbBmp, cfgCopy)
+            if (hdResult.success) {
+                cachedBitmapToken.set(token)
+            }
+            val hdSnap = FrameSnapshot(targetSession, token, argbBmp, hdResult)
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                btnSaveResult.isEnabled = true
+                if (targetSession == activeSessionId.get() && mode == AppMode.FROZEN) {
+                    lockedSnapshot = hdSnap
+                    renderSnapshot(hdSnap)
+                }
+            }
+        }
+    }
+
+    private fun cropBitmapToAspect(src: Bitmap, targetW: Int, targetH: Int): Bitmap {
+        if (targetW <= 0 || targetH <= 0 || src.width <= 0 || src.height <= 0) {
+            return src
+        }
+        val targetRatio = targetW.toFloat() / targetH.toFloat()
+        val srcRatio = src.width.toFloat() / src.height.toFloat()
+        if (kotlin.math.abs(targetRatio - srcRatio) < 0.01f) {
+            return src
+        }
+        val cropW: Int
+        val cropH: Int
+        if (targetRatio > srcRatio) {
+            cropW = src.width
+            cropH = (cropW / targetRatio).roundToInt().coerceIn(1, src.height)
+        } else {
+            cropH = src.height
+            cropW = (cropH * targetRatio).roundToInt().coerceIn(1, src.width)
+        }
+        val left = ((src.width - cropW) / 2).coerceIn(0, (src.width - cropW).coerceAtLeast(0))
+        val top = ((src.height - cropH) / 2).coerceIn(0, (src.height - cropH).coerceAtLeast(0))
+        val out = Bitmap.createBitmap(src, left, top, cropW, cropH)
+        if (out !== src) {
+            src.recycle()
+        }
+        return out
+    }
+
+    private fun scaleResultCoordinates(
+        res: DetectionResult,
+        fromW: Int,
+        fromH: Int,
+        toW: Int,
+        toH: Int
+    ): DetectionResult {
+        if (!res.success || fromW <= 0 || fromH <= 0 || (fromW == toW && fromH == toH)) {
+            return res
+        }
+        val sx = toW.toFloat() / fromW.toFloat()
+        val sy = toH.toFloat() / fromH.toFloat()
+        val scaledTrusses = res.trusses.map { t ->
+            t.copy(x1 = t.x1 * sx, y1 = t.y1 * sy, x2 = t.x2 * sx, y2 = t.y2 * sy)
+        }
+        val scaledFruits = res.fruits.map { f ->
+            f.copy(x1 = f.x1 * sx, y1 = f.y1 * sy, x2 = f.x2 * sx, y2 = f.y2 * sy)
+        }
+        return res.copy(trusses = scaledTrusses, fruits = scaledFruits)
+    }
+
     private fun startCamera() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
@@ -762,17 +874,27 @@ class MainActivity : AppCompatActivity() {
         previewView.post {
             if (isDestroyed || isFinishing || mode != AppMode.LIVE) return@post
 
-            val targetSize = targetResolutionSize()
+            val previewTargetSize = targetResolutionSize()
+            val analysisTarget = analysisTargetSize()
             val aspectStrategy = if (config.captureResIndex == 0) {
                 AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
             } else {
                 AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
             }
-            val resolutionSelector = ResolutionSelector.Builder()
+            val previewResolutionSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(aspectStrategy)
                 .setResolutionStrategy(
                     ResolutionStrategy(
-                        targetSize,
+                        previewTargetSize,
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    )
+                )
+                .build()
+            val analysisResolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(aspectStrategy)
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        analysisTarget,
                         ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                     )
                 )
@@ -780,13 +902,13 @@ class MainActivity : AppCompatActivity() {
 
             val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
             val preview = Preview.Builder()
-                .setResolutionSelector(resolutionSelector)
+                .setResolutionSelector(previewResolutionSelector)
                 .setTargetRotation(rotation)
                 .build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
             val imageAnalysis = ImageAnalysis.Builder()
-                .setResolutionSelector(resolutionSelector)
+                .setResolutionSelector(analysisResolutionSelector)
                 .setTargetRotation(rotation)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
